@@ -36,12 +36,81 @@ export interface InventoryBalance {
   availableQuantity: number;
 }
 
+export interface OperationsDashboard {
+  tenant: {
+    id: string;
+    primaryShopDomain: string;
+    status: string;
+  };
+  counts: {
+    operationsOrders: number;
+    purchaseNeeds: number;
+    purchaseOrders: number;
+    goodsReceipts: number;
+    inventoryMovements: number;
+  };
+  operationsOrders: Array<{
+    id: string;
+    orderNumber: string | null;
+    status: string;
+    originType: string;
+    createdAt: string;
+  }>;
+  purchaseNeeds: Array<{
+    id: string;
+    operationsOrderId: string | null;
+    operationsOrderNumber: string | null;
+    sku: string | null;
+    title: string;
+    quantityRequired: number;
+    quantityReserved: number;
+    quantityNeeded: number;
+    quantityCovered: number;
+    status: string;
+    supplierName: string | null;
+  }>;
+  purchaseOrders: Array<{
+    id: string;
+    supplierName: string;
+    poNumber: string | null;
+    status: string;
+    currency: string | null;
+    relatedNeedTitle: string | null;
+    relatedOrderNumber: string | null;
+    lineCount: number;
+    createdAt: string;
+  }>;
+  goodsReceipts: Array<{
+    id: string;
+    purchaseOrderId: string;
+    poNumber: string | null;
+    receiptNumber: string | null;
+    status: string;
+    sku: string | null;
+    title: string | null;
+    quantityReceived: number;
+    movementType: string | null;
+    receivedAt: string;
+  }>;
+  inventoryMovements: Array<{
+    id: string;
+    sku: string | null;
+    title: string | null;
+    movementType: string;
+    sourceType: string;
+    quantityDelta: number;
+    reservationDelta: number;
+    createdAt: string;
+  }>;
+}
+
 export interface CreatePurchaseOrderInput {
   supplierId: string;
   purchaseNeedIds: string[];
   expectedDeliveryDate?: string | null;
   currency?: string | null;
   notes?: string | null;
+  idempotencyKey?: string | null;
 }
 
 export interface PostGoodsReceiptInput {
@@ -49,6 +118,7 @@ export interface PostGoodsReceiptInput {
   receiptNumber?: string | null;
   receivedAt?: string | null;
   notes?: string | null;
+  idempotencyKey?: string | null;
   lines: Array<{
     purchaseOrderLineId: string;
     quantityReceived: number;
@@ -167,6 +237,308 @@ async function resolveTenantByShopDomain(db: QueryExecutor, shopDomain: string) 
   }
 
   return tenant;
+}
+
+export async function getTenantContextByShopDomain(
+  db: QueryExecutor,
+  shopDomain: string,
+): Promise<TenantContext> {
+  const tenant = await resolveTenantByShopDomain(db, shopDomain);
+
+  return {
+    tenantId: tenant.id,
+    shopDomain: normalizeShopDomain(shopDomain),
+  };
+}
+
+export function buildDemoShopifyOrderPayload(shopDomain: string): ShopifyOrderImportInput {
+  const normalizedShopDomain = normalizeShopDomain(shopDomain);
+
+  return {
+    shopDomain: normalizedShopDomain,
+    shopifyOrderId: `demo-core-order:${normalizedShopDomain}`,
+    shopifyOrderName: "DEV-OPS-1001",
+    customerName: "Development Customer",
+    customerExternalId: "demo-customer",
+    currency: "EUR",
+    rawPayload: {
+      source: "operations-ledger-dev-action",
+      shopDomain: normalizedShopDomain,
+    },
+    lines: [
+      {
+        shopifyVariantId: `demo-variant:${normalizedShopDomain}:ops-kit`,
+        sku: "OPS-KIT-DEMO",
+        title: "Operations Demo Kit",
+        quantity: 3,
+      },
+    ],
+  };
+}
+
+export async function getOperationsDashboard(
+  db: QueryExecutor,
+  ctx: TenantContext,
+): Promise<OperationsDashboard> {
+  const tenantResult = await db.query<{
+    id: string;
+    primary_shop_domain: string;
+    status: string;
+  }>(
+    `
+      select id, primary_shop_domain, status
+      from public.tenants
+      where id = $1
+      limit 1
+    `,
+    [ctx.tenantId],
+  );
+  const countsResult = await db.query<{
+    operations_orders: string;
+    purchase_needs: string;
+    purchase_orders: string;
+    goods_receipts: string;
+    inventory_movements: string;
+  }>(
+    `
+      select
+        (select count(*)::text from public.operations_orders where tenant_id = $1) as operations_orders,
+        (select count(*)::text from public.purchase_needs where tenant_id = $1) as purchase_needs,
+        (select count(*)::text from public.purchase_orders where tenant_id = $1) as purchase_orders,
+        (select count(*)::text from public.goods_receipts where tenant_id = $1) as goods_receipts,
+        (select count(*)::text from public.inventory_movements where tenant_id = $1) as inventory_movements
+    `,
+    [ctx.tenantId],
+  );
+  const ordersResult = await db.query<{
+    id: string;
+    order_number: string | null;
+    status: string;
+    origin_type: string;
+    created_at: Date;
+  }>(
+    `
+      select id, order_number, status, origin_type, created_at
+      from public.operations_orders
+      where tenant_id = $1
+      order by created_at desc
+      limit 10
+    `,
+    [ctx.tenantId],
+  );
+  const needsResult = await db.query<{
+    id: string;
+    operations_order_id: string | null;
+    operations_order_number: string | null;
+    sku: string | null;
+    title: string;
+    quantity_required: string | null;
+    quantity_reserved: string | null;
+    quantity_needed: string;
+    quantity_covered: string;
+    status: string;
+    supplier_name: string | null;
+  }>(
+    `
+      select purchase_needs.id,
+             purchase_needs.operations_order_id,
+             operations_orders.order_number as operations_order_number,
+             purchase_needs.sku,
+             purchase_needs.title,
+             operations_order_lines.quantity_required::text,
+             operations_order_lines.quantity_reserved::text,
+             purchase_needs.quantity_needed::text,
+             purchase_needs.quantity_covered::text,
+             purchase_needs.status,
+             max(suppliers.name) as supplier_name
+      from public.purchase_needs
+      left join public.operations_orders
+        on operations_orders.id = purchase_needs.operations_order_id
+      left join public.operations_order_lines
+        on operations_order_lines.id = purchase_needs.operations_order_line_id
+      left join public.purchase_order_lines
+        on purchase_order_lines.purchase_need_id = purchase_needs.id
+      left join public.purchase_orders
+        on purchase_orders.id = purchase_order_lines.purchase_order_id
+      left join public.suppliers
+        on suppliers.id = purchase_orders.supplier_id
+      where purchase_needs.tenant_id = $1
+      group by purchase_needs.id,
+               operations_orders.order_number,
+               operations_order_lines.quantity_required,
+               operations_order_lines.quantity_reserved
+      order by purchase_needs.created_at desc
+      limit 10
+    `,
+    [ctx.tenantId],
+  );
+  const purchaseOrdersResult = await db.query<{
+    id: string;
+    supplier_name: string;
+    po_number: string | null;
+    status: string;
+    currency: string | null;
+    related_need_title: string | null;
+    related_order_number: string | null;
+    line_count: string;
+    created_at: Date;
+  }>(
+    `
+      select purchase_orders.id,
+             suppliers.name as supplier_name,
+             purchase_orders.po_number,
+             purchase_orders.status,
+             purchase_orders.currency,
+             min(purchase_needs.title) as related_need_title,
+             min(operations_orders.order_number) as related_order_number,
+             count(purchase_order_lines.id)::text as line_count,
+             purchase_orders.created_at
+      from public.purchase_orders
+      join public.suppliers
+        on suppliers.id = purchase_orders.supplier_id
+      left join public.purchase_order_lines
+        on purchase_order_lines.purchase_order_id = purchase_orders.id
+      left join public.purchase_needs
+        on purchase_needs.id = purchase_order_lines.purchase_need_id
+      left join public.operations_orders
+        on operations_orders.id = purchase_needs.operations_order_id
+      where purchase_orders.tenant_id = $1
+      group by purchase_orders.id, suppliers.name
+      order by purchase_orders.created_at desc
+      limit 10
+    `,
+    [ctx.tenantId],
+  );
+  const goodsReceiptsResult = await db.query<{
+    id: string;
+    purchase_order_id: string;
+    po_number: string | null;
+    receipt_number: string | null;
+    status: string;
+    sku: string | null;
+    title: string | null;
+    quantity_received: string;
+    movement_type: string | null;
+    received_at: Date;
+  }>(
+    `
+      select goods_receipts.id,
+             goods_receipts.purchase_order_id,
+             purchase_orders.po_number,
+             goods_receipts.receipt_number,
+             goods_receipts.status,
+             min(goods_receipt_lines.sku) as sku,
+             min(goods_receipt_lines.title) as title,
+             coalesce(sum(goods_receipt_lines.quantity_received), 0)::text as quantity_received,
+             min(inventory_movements.movement_type) as movement_type,
+             goods_receipts.received_at
+      from public.goods_receipts
+      join public.purchase_orders
+        on purchase_orders.id = goods_receipts.purchase_order_id
+      left join public.goods_receipt_lines
+        on goods_receipt_lines.goods_receipt_id = goods_receipts.id
+      left join public.inventory_movements
+        on inventory_movements.source_type = 'GOODS_RECEIPT_LINE'
+       and inventory_movements.source_id = goods_receipt_lines.id
+      where goods_receipts.tenant_id = $1
+      group by goods_receipts.id, purchase_orders.po_number
+      order by goods_receipts.received_at desc
+      limit 10
+    `,
+    [ctx.tenantId],
+  );
+  const movementsResult = await db.query<{
+    id: string;
+    sku: string | null;
+    title: string | null;
+    movement_type: string;
+    source_type: string;
+    quantity_delta: string;
+    reservation_delta: string;
+    created_at: Date;
+  }>(
+    `
+      select id, sku, title, movement_type, source_type, quantity_delta::text, reservation_delta::text, created_at
+      from public.inventory_movements
+      where tenant_id = $1
+      order by created_at desc
+      limit 10
+    `,
+    [ctx.tenantId],
+  );
+  const tenant = tenantResult.rows[0];
+
+  if (!tenant) {
+    throw new Error("Tenant not found");
+  }
+
+  return {
+    tenant: {
+      id: tenant.id,
+      primaryShopDomain: tenant.primary_shop_domain,
+      status: tenant.status,
+    },
+    counts: {
+      operationsOrders: toNumber(countsResult.rows[0]?.operations_orders),
+      purchaseNeeds: toNumber(countsResult.rows[0]?.purchase_needs),
+      purchaseOrders: toNumber(countsResult.rows[0]?.purchase_orders),
+      goodsReceipts: toNumber(countsResult.rows[0]?.goods_receipts),
+      inventoryMovements: toNumber(countsResult.rows[0]?.inventory_movements),
+    },
+    operationsOrders: ordersResult.rows.map((order) => ({
+      id: order.id,
+      orderNumber: order.order_number,
+      status: order.status,
+      originType: order.origin_type,
+      createdAt: order.created_at.toISOString(),
+    })),
+    purchaseNeeds: needsResult.rows.map((need) => ({
+      id: need.id,
+      operationsOrderId: need.operations_order_id,
+      operationsOrderNumber: need.operations_order_number,
+      sku: need.sku,
+      title: need.title,
+      quantityRequired: toNumber(need.quantity_required),
+      quantityReserved: toNumber(need.quantity_reserved),
+      quantityNeeded: toNumber(need.quantity_needed),
+      quantityCovered: toNumber(need.quantity_covered),
+      status: need.status,
+      supplierName: need.supplier_name,
+    })),
+    purchaseOrders: purchaseOrdersResult.rows.map((purchaseOrder) => ({
+      id: purchaseOrder.id,
+      supplierName: purchaseOrder.supplier_name,
+      poNumber: purchaseOrder.po_number,
+      status: purchaseOrder.status,
+      currency: purchaseOrder.currency,
+      relatedNeedTitle: purchaseOrder.related_need_title,
+      relatedOrderNumber: purchaseOrder.related_order_number,
+      lineCount: toNumber(purchaseOrder.line_count),
+      createdAt: purchaseOrder.created_at.toISOString(),
+    })),
+    goodsReceipts: goodsReceiptsResult.rows.map((receipt) => ({
+      id: receipt.id,
+      purchaseOrderId: receipt.purchase_order_id,
+      poNumber: receipt.po_number,
+      receiptNumber: receipt.receipt_number,
+      status: receipt.status,
+      sku: receipt.sku,
+      title: receipt.title,
+      quantityReceived: toNumber(receipt.quantity_received),
+      movementType: receipt.movement_type,
+      receivedAt: receipt.received_at.toISOString(),
+    })),
+    inventoryMovements: movementsResult.rows.map((movement) => ({
+      id: movement.id,
+      sku: movement.sku,
+      title: movement.title,
+      movementType: movement.movement_type,
+      sourceType: movement.source_type,
+      quantityDelta: toNumber(movement.quantity_delta),
+      reservationDelta: toNumber(movement.reservation_delta),
+      createdAt: movement.created_at.toISOString(),
+    })),
+  };
 }
 
 export async function importShopifyOrder(
@@ -704,6 +1076,34 @@ export async function createPurchaseOrderFromNeeds(
     throw new Error("Purchase order requires at least one purchase need");
   }
 
+  const idempotencyKey = input.idempotencyKey?.trim() || null;
+
+  if (idempotencyKey) {
+    const existingResult = await db.query<{ id: string; status: string }>(
+      `
+        select purchase_orders.id, purchase_orders.status
+        from public.idempotency_keys
+        join public.purchase_orders
+          on purchase_orders.id = idempotency_keys.result_ref_id
+        where idempotency_keys.tenant_id = $1
+          and idempotency_keys.key = $2
+          and idempotency_keys.purpose = 'PURCHASE_ORDER_CREATE'
+          and idempotency_keys.result_ref_type = 'purchase_order'
+        limit 1
+      `,
+      [ctx.tenantId, idempotencyKey],
+    );
+    const existing = existingResult.rows[0];
+
+    if (existing) {
+      return {
+        purchaseOrderId: existing.id,
+        status: existing.status,
+        alreadyCreated: true,
+      };
+    }
+  }
+
   const supplierResult = await db.query<{ id: string }>(
     `
       select id
@@ -811,6 +1211,9 @@ export async function createPurchaseOrderFromNeeds(
     eventType: "PURCHASE_ORDER_CREATED",
     aggregateType: "purchase_order",
     aggregateId: purchaseOrder.id,
+    idempotencyKey: idempotencyKey
+      ? `purchase_order_created:${idempotencyKey}`
+      : null,
     payload: {
       purchase_order_id: purchaseOrder.id,
       supplier_id: input.supplierId,
@@ -819,9 +1222,27 @@ export async function createPurchaseOrderFromNeeds(
     },
   });
 
+  if (idempotencyKey) {
+    await db.query(
+      `
+        insert into public.idempotency_keys (
+          tenant_id,
+          key,
+          purpose,
+          result_ref_type,
+          result_ref_id
+        )
+        values ($1, $2, 'PURCHASE_ORDER_CREATE', 'purchase_order', $3)
+        on conflict (tenant_id, key) do nothing
+      `,
+      [ctx.tenantId, idempotencyKey, purchaseOrder.id],
+    );
+  }
+
   return {
     purchaseOrderId: purchaseOrder.id,
     status: purchaseOrder.status,
+    alreadyCreated: false,
   };
 }
 
@@ -830,6 +1251,34 @@ export async function sendPurchaseOrder(
   ctx: TenantContext,
   purchaseOrderId: string,
 ) {
+  const purchaseOrderStatusResult = await db.query<{
+    id: string;
+    status: string;
+    po_number: string | null;
+  }>(
+    `
+      select id, status, po_number
+      from public.purchase_orders
+      where tenant_id = $1
+        and id = $2
+      limit 1
+    `,
+    [ctx.tenantId, purchaseOrderId],
+  );
+  const currentPurchaseOrder = purchaseOrderStatusResult.rows[0];
+
+  if (!currentPurchaseOrder) {
+    throw new Error("Purchase order not found");
+  }
+
+  if (currentPurchaseOrder.status === "SENT") {
+    return {
+      purchaseOrderId: currentPurchaseOrder.id,
+      status: currentPurchaseOrder.status,
+      alreadySent: true,
+    };
+  }
+
   const lineCountResult = await db.query<{ count: string }>(
     `
       select count(*)::text as count
@@ -872,7 +1321,11 @@ export async function sendPurchaseOrder(
     },
   });
 
-  return { purchaseOrderId: purchaseOrder.id, status: purchaseOrder.status };
+  return {
+    purchaseOrderId: purchaseOrder.id,
+    status: purchaseOrder.status,
+    alreadySent: false,
+  };
 }
 
 export async function postGoodsReceipt(
@@ -882,6 +1335,40 @@ export async function postGoodsReceipt(
 ) {
   if (input.lines.length === 0) {
     throw new Error("Goods receipt requires at least one line");
+  }
+
+  const idempotencyKey = input.idempotencyKey?.trim() || null;
+
+  if (idempotencyKey) {
+    const existingResult = await db.query<{
+      id: string;
+      purchase_order_status: string;
+    }>(
+      `
+        select goods_receipts.id,
+               purchase_orders.status as purchase_order_status
+        from public.idempotency_keys
+        join public.goods_receipts
+          on goods_receipts.id = idempotency_keys.result_ref_id
+        join public.purchase_orders
+          on purchase_orders.id = goods_receipts.purchase_order_id
+        where idempotency_keys.tenant_id = $1
+          and idempotency_keys.key = $2
+          and idempotency_keys.purpose = 'GOODS_RECEIPT_POST'
+          and idempotency_keys.result_ref_type = 'goods_receipt'
+        limit 1
+      `,
+      [ctx.tenantId, idempotencyKey],
+    );
+    const existing = existingResult.rows[0];
+
+    if (existing) {
+      return {
+        goodsReceiptId: existing.id,
+        purchaseOrderStatus: existing.purchase_order_status,
+        alreadyPosted: true,
+      };
+    }
   }
 
   const purchaseOrderResult = await db.query<{ id: string; status: string }>(
@@ -1128,6 +1615,7 @@ export async function postGoodsReceipt(
     eventType: "GOODS_RECEIVED",
     aggregateType: "goods_receipt",
     aggregateId: goodsReceiptId,
+    idempotencyKey: idempotencyKey ? `goods_received:${idempotencyKey}` : null,
     payload: {
       goods_receipt_id: goodsReceiptId,
       purchase_order_id: input.purchaseOrderId,
@@ -1135,8 +1623,26 @@ export async function postGoodsReceipt(
     },
   });
 
+  if (idempotencyKey) {
+    await db.query(
+      `
+        insert into public.idempotency_keys (
+          tenant_id,
+          key,
+          purpose,
+          result_ref_type,
+          result_ref_id
+        )
+        values ($1, $2, 'GOODS_RECEIPT_POST', 'goods_receipt', $3)
+        on conflict (tenant_id, key) do nothing
+      `,
+      [ctx.tenantId, idempotencyKey, goodsReceiptId],
+    );
+  }
+
   return {
     goodsReceiptId,
     purchaseOrderStatus,
+    alreadyPosted: false,
   };
 }

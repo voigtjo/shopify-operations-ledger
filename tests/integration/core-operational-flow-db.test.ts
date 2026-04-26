@@ -261,8 +261,20 @@ describeIfDatabase("core operational flow against local Supabase", () => {
       supplierId: supplier.supplierId,
       purchaseNeedIds,
       currency: "EUR",
+      idempotencyKey: "test:create-po:procure",
+    });
+    const repeatedPurchaseOrder = await createPurchaseOrderFromNeeds(pool, ctx, {
+      supplierId: supplier.supplierId,
+      purchaseNeedIds,
+      currency: "EUR",
+      idempotencyKey: "test:create-po:procure",
     });
     const sentPurchaseOrder = await sendPurchaseOrder(
+      pool,
+      ctx,
+      purchaseOrder.purchaseOrderId,
+    );
+    const repeatedSentPurchaseOrder = await sendPurchaseOrder(
       pool,
       ctx,
       purchaseOrder.purchaseOrderId,
@@ -285,6 +297,17 @@ describeIfDatabase("core operational flow against local Supabase", () => {
           quantityReceived: 10,
         },
       ],
+      idempotencyKey: "test:goods-receipt:procure",
+    });
+    const repeatedGoodsReceipt = await postGoodsReceipt(pool, ctx, {
+      purchaseOrderId: purchaseOrder.purchaseOrderId,
+      lines: [
+        {
+          purchaseOrderLineId: purchaseOrderLine.rows[0]!.id,
+          quantityReceived: 10,
+        },
+      ],
+      idempotencyKey: "test:goods-receipt:procure",
     });
     const balance = await getInventoryBalance(pool, ctx, {
       shopifyVariantId: "gid://shopify/ProductVariant/procure",
@@ -298,10 +321,63 @@ describeIfDatabase("core operational flow against local Supabase", () => {
       `,
       [ctx.tenantId, purchaseNeedIds[0]],
     );
+    const recordCounts = await pool.query<{
+      purchase_orders: string;
+      goods_receipts: string;
+      goods_receipt_lines: string;
+      goods_receipt_movements: string;
+    }>(
+      `
+        select
+          (select count(*)::text from public.purchase_orders where tenant_id = $1) as purchase_orders,
+          (select count(*)::text from public.goods_receipts where tenant_id = $1) as goods_receipts,
+          (select count(*)::text from public.goods_receipt_lines where tenant_id = $1) as goods_receipt_lines,
+          (
+            select count(*)::text
+            from public.inventory_movements
+            where tenant_id = $1
+              and movement_type = 'GOODS_RECEIPT'
+          ) as goods_receipt_movements
+      `,
+      [ctx.tenantId],
+    );
+    const eventCounts = await pool.query<{ event_type: string; count: string }>(
+      `
+        select event_type, count(*)::text as count
+        from public.domain_events
+        where tenant_id = $1
+          and event_type in (
+            'PURCHASE_ORDER_CREATED',
+            'PURCHASE_ORDER_SENT',
+            'GOODS_RECEIVED',
+            'INVENTORY_MOVEMENT_CREATED'
+          )
+        group by event_type
+      `,
+      [ctx.tenantId],
+    );
+    const eventCountByType = new Map(
+      eventCounts.rows.map((row) => [row.event_type, row.count]),
+    );
 
     expect(purchaseOrder.status).toBe("DRAFT");
+    expect(repeatedPurchaseOrder).toMatchObject({
+      purchaseOrderId: purchaseOrder.purchaseOrderId,
+      status: "DRAFT",
+      alreadyCreated: true,
+    });
     expect(sentPurchaseOrder.status).toBe("SENT");
+    expect(repeatedSentPurchaseOrder).toMatchObject({
+      purchaseOrderId: purchaseOrder.purchaseOrderId,
+      status: "SENT",
+      alreadySent: true,
+    });
     expect(goodsReceipt.purchaseOrderStatus).toBe("FULLY_RECEIVED");
+    expect(repeatedGoodsReceipt).toMatchObject({
+      goodsReceiptId: goodsReceipt.goodsReceiptId,
+      purchaseOrderStatus: "FULLY_RECEIVED",
+      alreadyPosted: true,
+    });
     expect(needResult.rows[0]).toEqual({
       status: "COVERED",
       quantity_covered: "10.0000",
@@ -311,5 +387,15 @@ describeIfDatabase("core operational flow against local Supabase", () => {
       reservedQuantity: 0,
       availableQuantity: 10,
     });
+    expect(recordCounts.rows[0]).toEqual({
+      purchase_orders: "1",
+      goods_receipts: "1",
+      goods_receipt_lines: "1",
+      goods_receipt_movements: "1",
+    });
+    expect(eventCountByType.get("PURCHASE_ORDER_CREATED")).toBe("1");
+    expect(eventCountByType.get("PURCHASE_ORDER_SENT")).toBe("1");
+    expect(eventCountByType.get("GOODS_RECEIVED")).toBe("1");
+    expect(eventCountByType.get("INVENTORY_MOVEMENT_CREATED")).toBe("1");
   });
 });
