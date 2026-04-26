@@ -17,6 +17,8 @@ The Operations Ledger foundation schema is versioned separately as Supabase/Post
 
 This keeps the Shopify template working while preparing the Postgres schema that future phases will use.
 
+Phase 3 adds a minimal Node/Postgres access layer for tenant bootstrap. It uses `pg` against the local Supabase Postgres URL and does not replace Prisma session storage.
+
 ## Why Supabase migrations are separate from Prisma for now
 
 The scaffold already depends on Prisma session storage for Shopify OAuth/session handling. Switching the scaffold datasource to Postgres in Phase 2 would be a broader runtime change than required.
@@ -51,6 +53,7 @@ The initial migration creates:
 - `role_permissions`
 - `user_roles`
 - `jobs`
+- `tenant_onboarding`
 
 No Operations Orders, procurement, fulfillment, production or accounting tables are introduced in Phase 2.
 
@@ -65,3 +68,16 @@ Supabase Row Level Security is not enabled in this phase. The spec requires serv
 Automated tests currently verify that the migration contains the required foundation tables, tenant columns and selected idempotency indexes.
 
 Full local database verification is pending until Supabase CLI and Docker are installed on this machine.
+
+## Tenant bootstrap environment
+
+To write tenant bootstrap data during Shopify Admin preview, set:
+
+```bash
+export OPERATIONS_LEDGER_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:54322/postgres"
+export OPERATIONS_LEDGER_TOKEN_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+```
+
+`OPERATIONS_LEDGER_DATABASE_URL` is separate from Prisma so the Shopify session scaffold remains on SQLite. `OPERATIONS_LEDGER_TOKEN_ENCRYPTION_KEY` is required whenever tenant bootstrap writes Shopify installation tokens, because access tokens must be encrypted at rest.
+
+If `OPERATIONS_LEDGER_DATABASE_URL` is not set, Shopify preview still works and tenant bootstrap is skipped.

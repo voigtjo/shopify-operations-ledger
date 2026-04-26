@@ -3,10 +3,15 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-const migration = readFileSync(
+const foundationMigration = readFileSync(
   resolve("supabase/migrations/20260426143000_foundation_tables.sql"),
   "utf8",
 ).toLowerCase();
+const onboardingMigration = readFileSync(
+  resolve("supabase/migrations/20260426160000_tenant_onboarding.sql"),
+  "utf8",
+).toLowerCase();
+const migration = `${foundationMigration}\n${onboardingMigration}`;
 
 const tenantOwnedTables = [
   "shopify_installations",
@@ -24,6 +29,7 @@ const requiredTables = [
   "permissions",
   "role_permissions",
   "user_roles",
+  "tenant_onboarding",
 ];
 
 describe("Supabase foundation migration", () => {
@@ -56,5 +62,16 @@ describe("Supabase foundation migration", () => {
     expect(migration).toContain("integration_events_payload_dedup_idx");
     expect(migration).toContain("unique (tenant_id, job_type, idempotency_key)");
     expect(migration).toContain("jobs_status_run_after_idx");
+  });
+
+  it("creates tenant onboarding for install bootstrap state", () => {
+    expect(onboardingMigration).toContain(
+      "create table public.tenant_onboarding",
+    );
+    expect(onboardingMigration).toContain("tenant_id uuid not null");
+    expect(onboardingMigration).toContain(
+      "status text not null check (status in ('not_started', 'started', 'completed', 'skipped'))",
+    );
+    expect(onboardingMigration).toContain("unique (tenant_id)");
   });
 });
