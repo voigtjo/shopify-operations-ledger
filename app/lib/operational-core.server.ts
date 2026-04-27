@@ -251,6 +251,47 @@ export async function getTenantContextByShopDomain(
   };
 }
 
+export async function getImportedShopifyOrderRefs(
+  db: QueryExecutor,
+  ctx: TenantContext,
+  shopifyOrderIds: string[],
+) {
+  if (shopifyOrderIds.length === 0) {
+    return new Map<
+      string,
+      { operationsOrderId: string; operationsOrderStatus: string }
+    >();
+  }
+
+  const result = await db.query<{
+    shopify_order_id: string;
+    operations_order_id: string;
+    operations_order_status: string;
+  }>(
+    `
+      select shopify_order_refs.shopify_order_id,
+             operations_orders.id as operations_order_id,
+             operations_orders.status as operations_order_status
+      from public.shopify_order_refs
+      join public.operations_orders
+        on operations_orders.origin_ref_id = shopify_order_refs.id
+      where shopify_order_refs.tenant_id = $1
+        and shopify_order_refs.shopify_order_id = any($2::text[])
+    `,
+    [ctx.tenantId, shopifyOrderIds],
+  );
+
+  return new Map(
+    result.rows.map((row) => [
+      row.shopify_order_id,
+      {
+        operationsOrderId: row.operations_order_id,
+        operationsOrderStatus: row.operations_order_status,
+      },
+    ]),
+  );
+}
+
 export function buildDemoShopifyOrderPayload(shopDomain: string): ShopifyOrderImportInput {
   const normalizedShopDomain = normalizeShopDomain(shopDomain);
 

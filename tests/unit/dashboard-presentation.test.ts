@@ -33,6 +33,15 @@ function dashboard(
 }
 
 describe("dashboard presentation helpers", () => {
+  it("prioritizes real Shopify orders ready to import", () => {
+    expect(
+      getDashboardNextAction(null, { pendingShopifyOrderCount: 2 }),
+    ).toEqual({
+      stage: "ORDER",
+      message: "You have 2 Shopify orders ready to import.",
+    });
+  });
+
   it("starts with demo order creation", () => {
     expect(getDashboardNextAction(null)).toEqual({
       stage: "ORDER",

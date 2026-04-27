@@ -22,7 +22,17 @@ export const dashboardFlowStages = [
 
 export function getDashboardNextAction(
   dashboard: OperationsDashboard | null,
+  options: { pendingShopifyOrderCount?: number } = {},
 ): DashboardNextAction {
+  if ((options.pendingShopifyOrderCount ?? 0) > 0) {
+    return {
+      stage: "ORDER",
+      message: `You have ${options.pendingShopifyOrderCount} Shopify ${
+        options.pendingShopifyOrderCount === 1 ? "order" : "orders"
+      } ready to import.`,
+    };
+  }
+
   if (!dashboard || dashboard.counts.operationsOrders === 0) {
     return {
       stage: "ORDER",

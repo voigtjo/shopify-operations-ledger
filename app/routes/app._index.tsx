@@ -10,6 +10,7 @@ import {
   buildDemoShopifyOrderPayload,
   createPurchaseOrderFromNeeds,
   createSupplier,
+  getImportedShopifyOrderRefs,
   getTenantContextByShopDomain,
   importShopifyOrder,
   postGoodsReceipt,
@@ -17,6 +18,11 @@ import {
   sendPurchaseOrder,
 } from "../lib/operational-core.server";
 import { loadDashboardForShop } from "../lib/operations-dashboard.server";
+import {
+  fetchRecentShopifyOrders,
+  fetchShopifyOrderById,
+  importShopifyOrderWithSupplyCheck,
+} from "../lib/shopify-orders.server";
 import {
   PgTenantBootstrapStore,
   bootstrapTenantFromShopifySession,
@@ -26,6 +32,14 @@ import { authenticate } from "../shopify.server";
 type ActionResult =
   | { ok: true; message: string }
   | { ok: false; message: string };
+
+type ShopifyOrderForDashboard = Awaited<
+  ReturnType<typeof fetchRecentShopifyOrders>
+>[number] & {
+  imported: boolean;
+  operationsOrderId: string | null;
+  operationsOrderStatus: string | null;
+};
 
 function formString(formData: FormData, key: string) {
   const value = formData.get(key);
@@ -64,17 +78,59 @@ async function getRemainingReceiptLines(
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-
-  return loadDashboardForShop({
+  const { admin, session } = await authenticate.admin(request);
+  const dashboardState = await loadDashboardForShop({
     shopDomain: session.shop,
     accessToken: session.accessToken,
     scopes: session.scope,
   });
+  let shopifyOrders: ShopifyOrderForDashboard[] = [];
+  let shopifyOrdersError: string | null = null;
+
+  try {
+    const recentOrders = await fetchRecentShopifyOrders(admin, 10);
+    const pool = getFoundationDatabasePool();
+
+    if (pool && dashboardState.configured) {
+      const ctx = await getTenantContextByShopDomain(pool, session.shop);
+      const importedRefs = await getImportedShopifyOrderRefs(
+        pool,
+        ctx,
+        recentOrders.map((order) => order.id),
+      );
+
+      shopifyOrders = recentOrders.map((order) => {
+        const imported = importedRefs.get(order.id);
+
+        return {
+          ...order,
+          imported: Boolean(imported),
+          operationsOrderId: imported?.operationsOrderId ?? null,
+          operationsOrderStatus: imported?.operationsOrderStatus ?? null,
+        };
+      });
+    } else {
+      shopifyOrders = recentOrders.map((order) => ({
+        ...order,
+        imported: false,
+        operationsOrderId: null,
+        operationsOrderStatus: null,
+      }));
+    }
+  } catch (error) {
+    shopifyOrdersError =
+      error instanceof Error ? error.message : "Unable to load Shopify orders.";
+  }
+
+  return {
+    ...dashboardState,
+    shopifyOrders,
+    shopifyOrdersError,
+  };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
   const pool = getFoundationDatabasePool();
@@ -99,6 +155,32 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const ctx = await getTenantContextByShopDomain(pool, session.shop);
   const demoOrder = buildDemoShopifyOrderPayload(session.shop);
+
+  if (intent === "import-shopify-order") {
+    const shopifyOrderId = formString(formData, "shopifyOrderId");
+
+    if (!shopifyOrderId) {
+      return {
+        ok: false,
+        message: "Select a Shopify order before importing.",
+      } satisfies ActionResult;
+    }
+
+    const shopifyOrder = await fetchShopifyOrderById(admin, shopifyOrderId);
+    const result = await importShopifyOrderWithSupplyCheck(
+      pool,
+      ctx,
+      session.shop,
+      shopifyOrder,
+    );
+
+    return {
+      ok: true,
+      message: result.importResult.alreadyImported
+        ? `Shopify order ${shopifyOrder.name} is already in Operations Ledger. Supply check is up to date: ${result.supplyCheck.status}.`
+        : `Imported ${shopifyOrder.name} and ran supply check: ${result.supplyCheck.status}.`,
+    } satisfies ActionResult;
+  }
 
   if (intent === "create-demo-order") {
     const result = await importShopifyOrder(pool, demoOrder);
@@ -238,7 +320,12 @@ export default function Index() {
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const isSubmitting = navigation.state !== "idle";
-  const nextAction = getDashboardNextAction(data.dashboard);
+  const pendingShopifyOrderCount = data.shopifyOrders.filter(
+    (order) => !order.imported && order.lines.length > 0,
+  ).length;
+  const nextAction = getDashboardNextAction(data.dashboard, {
+    pendingShopifyOrderCount,
+  });
   const activeFlowStage = dashboardFlowStages.findIndex((stage) =>
     nextAction.stage === "ORDER"
       ? stage === "Order"
@@ -317,12 +404,87 @@ export default function Index() {
         </s-stack>
       </s-section>
 
-      <s-section heading="Demo actions">
+      <s-section heading="Shopify Orders">
+        <s-stack direction="block" gap="base">
+          {data.shopifyOrdersError && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>{data.shopifyOrdersError}</s-paragraph>
+              <s-paragraph>
+                Confirm the app has the <code>read_orders</code> scope, then
+                reopen the Shopify preview.
+              </s-paragraph>
+            </s-box>
+          )}
+          {!data.shopifyOrdersError && data.shopifyOrders.length === 0 && (
+            <EmptyState>No recent Shopify Orders found.</EmptyState>
+          )}
+          {data.shopifyOrders.map((order) => (
+            <s-box
+              key={order.id}
+              padding="base"
+              borderWidth="base"
+              borderRadius="base"
+            >
+              <s-stack direction="block" gap="small">
+                <s-paragraph>
+                  <s-text>{order.name}</s-text>
+                  <s-text>
+                    {" "}
+                    · {order.imported
+                      ? `Imported (${order.operationsOrderStatus})`
+                      : "Ready to import"}
+                  </s-text>
+                </s-paragraph>
+                <s-paragraph>
+                  <s-text>
+                    {order.lines.length} line
+                    {order.lines.length === 1 ? "" : "s"}
+                  </s-text>
+                  {order.lines[0] && (
+                    <s-text>
+                      {" "}
+                      · {order.lines[0].sku ?? order.lines[0].title} · qty{" "}
+                      {formatQuantity(order.lines[0].quantity)}
+                    </s-text>
+                  )}
+                </s-paragraph>
+                {!order.imported && order.lines.length > 0 && (
+                  <Form method="post">
+                    <input
+                      type="hidden"
+                      name="intent"
+                      value="import-shopify-order"
+                    />
+                    <input
+                      type="hidden"
+                      name="shopifyOrderId"
+                      value={order.id}
+                    />
+                    <s-button
+                      type="submit"
+                      {...(isSubmitting ? { loading: true } : {})}
+                      disabled={!data.configured}
+                    >
+                      Import Order into Operations Ledger
+                    </s-button>
+                  </Form>
+                )}
+                {!order.imported && order.lines.length === 0 && (
+                  <s-paragraph>No line items available to import.</s-paragraph>
+                )}
+              </s-stack>
+            </s-box>
+          ))}
+        </s-stack>
+      </s-section>
+
+      <s-section heading="Demo fallback actions">
         <s-stack direction="inline" gap="base">
           <Form method="post">
             <input type="hidden" name="intent" value="create-demo-order" />
             <s-button
               type="submit"
+              variant="secondary"
               {...(isSubmitting ? { loading: true } : {})}
               disabled={!data.configured}
             >

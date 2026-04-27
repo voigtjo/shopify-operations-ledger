@@ -12,6 +12,7 @@ import {
   sendPurchaseOrder,
   type TenantContext,
 } from "../../app/lib/operational-core.server";
+import { importShopifyOrderWithSupplyCheck } from "../../app/lib/shopify-orders.server";
 
 const connectionString = process.env.OPERATIONS_LEDGER_DATABASE_URL;
 const describeIfDatabase = connectionString ? describe : describe.skip;
@@ -234,6 +235,63 @@ describeIfDatabase("core operational flow against local Supabase", () => {
       count: "1",
       quantity_needed: "6.0000",
       status: "OPEN",
+    });
+  });
+
+  it("imports a real Shopify order shape and automatically runs supply check idempotently", async () => {
+    const first = await importShopifyOrderWithSupplyCheck(pool, ctx, testShopDomain, {
+      id: "gid://shopify/Order/real-import",
+      name: "#2001",
+      createdAt: "2026-04-26T12:00:00Z",
+      lines: [
+        {
+          title: "Real Shopify Item",
+          quantity: 5,
+          sku: "REAL-001",
+          shopifyVariantId: "gid://shopify/ProductVariant/real-001",
+        },
+      ],
+    });
+    const second = await importShopifyOrderWithSupplyCheck(pool, ctx, testShopDomain, {
+      id: "gid://shopify/Order/real-import",
+      name: "#2001",
+      createdAt: "2026-04-26T12:00:00Z",
+      lines: [
+        {
+          title: "Real Shopify Item",
+          quantity: 5,
+          sku: "REAL-001",
+          shopifyVariantId: "gid://shopify/ProductVariant/real-001",
+        },
+      ],
+    });
+    const counts = await pool.query<{
+      order_count: string;
+      purchase_need_count: string;
+    }>(
+      `
+        select
+          (select count(*)::text from public.operations_orders where tenant_id = $1) as order_count,
+          (select count(*)::text from public.purchase_needs where tenant_id = $1) as purchase_need_count
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(first.importResult).toMatchObject({
+      alreadyImported: false,
+      status: "OPEN",
+    });
+    expect(first.supplyCheck.status).toBe("SUPPLY_PENDING");
+    expect(first.supplyCheck.createdPurchaseNeeds).toHaveLength(1);
+    expect(second.importResult).toMatchObject({
+      alreadyImported: true,
+      operationsOrderId: first.importResult.operationsOrderId,
+    });
+    expect(second.supplyCheck.status).toBe("SUPPLY_PENDING");
+    expect(second.supplyCheck.createdPurchaseNeeds).toHaveLength(0);
+    expect(counts.rows[0]).toEqual({
+      order_count: "1",
+      purchase_need_count: "1",
     });
   });
 
