@@ -57,6 +57,7 @@ describe("dashboard presentation helpers", () => {
           operationsOrders: [
             {
               id: "order-1",
+              operationCaseId: "case-1",
               orderNumber: "DEV-OPS-1001",
               status: "OPEN",
               originType: "SHOPIFY_ORDER",

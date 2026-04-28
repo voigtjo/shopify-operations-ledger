@@ -20,6 +20,9 @@ interface ShopifyOrderLineNode {
   variant?: {
     id: string;
     sku?: string | null;
+    product?: {
+      id: string;
+    } | null;
   } | null;
 }
 
@@ -50,6 +53,7 @@ export interface RecentShopifyOrder {
     title: string;
     quantity: number;
     sku: string | null;
+    shopifyProductId?: string | null;
     shopifyVariantId: string | null;
   }>;
 }
@@ -67,6 +71,9 @@ const ORDER_FIELDS = `#graphql
         variant {
           id
           sku
+          product {
+            id
+          }
         }
       }
     }
@@ -92,6 +99,7 @@ function normalizeShopifyOrder(node: ShopifyOrderNode): RecentShopifyOrder {
       title: line.title,
       quantity: line.quantity,
       sku: line.variant?.sku ?? line.sku ?? null,
+      shopifyProductId: line.variant?.product?.id ?? null,
       shopifyVariantId: line.variant?.id ?? null,
     })),
   };
@@ -163,6 +171,7 @@ export function mapShopifyOrderToOperationsOrderInput(
       .filter((line) => line.quantity > 0)
       .map((line) => ({
         shopifyVariantId: line.shopifyVariantId,
+        shopifyProductId: line.shopifyProductId,
         sku: line.sku,
         title: line.title,
         quantity: line.quantity,

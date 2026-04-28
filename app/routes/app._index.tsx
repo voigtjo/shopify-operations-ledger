@@ -7,6 +7,11 @@ import {
 } from "../lib/dashboard-presentation";
 import { getFoundationDatabasePool } from "../lib/foundation-db.server";
 import {
+  createDemoOperationalCases,
+  loadCaseList,
+  loadRecentCaseEvents,
+} from "../lib/operational-case.server";
+import {
   buildDemoShopifyOrderPayload,
   createPurchaseOrderFromNeeds,
   createSupplier,
@@ -86,6 +91,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
   let shopifyOrders: ShopifyOrderForDashboard[] = [];
   let shopifyOrdersError: string | null = null;
+  let operationCases: Awaited<ReturnType<typeof loadCaseList>> = [];
+  let recentCaseEvents: Awaited<ReturnType<typeof loadRecentCaseEvents>> = [];
 
   try {
     const recentOrders = await fetchRecentShopifyOrders(admin, 10);
@@ -122,10 +129,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       error instanceof Error ? error.message : "Unable to load Shopify orders.";
   }
 
+  if (dashboardState.configured) {
+    const pool = getFoundationDatabasePool();
+
+    if (pool) {
+      const ctx = await getTenantContextByShopDomain(pool, session.shop);
+
+      operationCases = await loadCaseList(pool, ctx, { limit: 12 });
+      recentCaseEvents = await loadRecentCaseEvents(pool, ctx, { limit: 8 });
+    }
+  }
+
   return {
     ...dashboardState,
     shopifyOrders,
     shopifyOrdersError,
+    operationCases,
+    recentCaseEvents,
   };
 };
 
@@ -179,6 +199,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       message: result.importResult.alreadyImported
         ? `Shopify order ${shopifyOrder.name} is already in Operations Ledger. Supply check is up to date: ${result.supplyCheck.status}.`
         : `Imported ${shopifyOrder.name} and ran supply check: ${result.supplyCheck.status}.`,
+    } satisfies ActionResult;
+  }
+
+  if (intent === "create-demo-operational-cases") {
+    const result = await createDemoOperationalCases(pool, ctx);
+
+    return {
+      ok: true,
+      message: `Demo operational cases are ready (${result.operationCaseIds.length}).`,
     } satisfies ActionResult;
   }
 
@@ -311,6 +340,13 @@ function remainingNeedQuantity(input: {
   return Math.max(input.quantityNeeded - input.quantityCovered, 0);
 }
 
+function formatCaseType(caseType: string) {
+  return caseType
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 function EmptyState({ children }: { children: string }) {
   return <s-paragraph>{children}</s-paragraph>;
 }
@@ -326,6 +362,21 @@ export default function Index() {
   const nextAction = getDashboardNextAction(data.dashboard, {
     pendingShopifyOrderCount,
   });
+  const openCases = data.operationCases.filter((operationCase) =>
+    ["open", "in_progress"].includes(operationCase.status),
+  );
+  const blockedCases = data.operationCases.filter(
+    (operationCase) => operationCase.status === "blocked",
+  );
+  const decisionCases = data.operationCases.filter(
+    (operationCase) =>
+      operationCase.status === "waiting_for_decision" ||
+      operationCase.pendingDecisionCount > 0,
+  );
+  const openTaskCount = data.operationCases.reduce(
+    (sum, operationCase) => sum + operationCase.openTaskCount,
+    0,
+  );
   const activeFlowStage = dashboardFlowStages.findIndex((stage) =>
     nextAction.stage === "ORDER"
       ? stage === "Order"
@@ -401,6 +452,98 @@ export default function Index() {
               </s-box>
             ))}
           </s-stack>
+        </s-stack>
+      </s-section>
+
+      <s-section heading="Operational work">
+        <s-stack direction="block" gap="base">
+          <s-box padding="base" borderWidth="base" borderRadius="base">
+            <s-heading>Open work</s-heading>
+            {openCases.length ? (
+              <s-stack direction="block" gap="small">
+                {openCases.slice(0, 5).map((operationCase) => (
+                  <s-paragraph key={operationCase.id}>
+                    <s-link href={`/app/cases/${operationCase.id}`}>
+                      {operationCase.summary}
+                    </s-link>
+                    <s-text> · {formatCaseType(operationCase.caseType)}</s-text>
+                    <s-text> · {operationCase.priority}</s-text>
+                    {operationCase.assignedRoleName && (
+                      <s-text> · {operationCase.assignedRoleName}</s-text>
+                    )}
+                  </s-paragraph>
+                ))}
+              </s-stack>
+            ) : (
+              <EmptyState>No open cases yet.</EmptyState>
+            )}
+          </s-box>
+
+          <s-stack direction="inline" gap="base">
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{openTaskCount}</s-heading>
+              <s-paragraph>My tasks placeholder</s-paragraph>
+            </s-box>
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{blockedCases.length}</s-heading>
+              <s-paragraph>Blocked cases</s-paragraph>
+            </s-box>
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{decisionCases.length}</s-heading>
+              <s-paragraph>Needs decision</s-paragraph>
+            </s-box>
+          </s-stack>
+
+          {blockedCases.length > 0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>Blocked cases</s-heading>
+              {blockedCases.slice(0, 3).map((operationCase) => (
+                <s-paragraph key={operationCase.id}>
+                  <s-link href={`/app/cases/${operationCase.id}`}>
+                    {operationCase.summary}
+                  </s-link>
+                  <s-text>
+                    {" "}
+                    · {operationCase.blockedReason ?? "Blocked"}
+                  </s-text>
+                </s-paragraph>
+              ))}
+            </s-box>
+          )}
+
+          {decisionCases.length > 0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>Needs decision</s-heading>
+              {decisionCases.slice(0, 3).map((operationCase) => (
+                <s-paragraph key={operationCase.id}>
+                  <s-link href={`/app/cases/${operationCase.id}`}>
+                    {operationCase.summary}
+                  </s-link>
+                  <s-text>
+                    {" "}
+                    · {operationCase.pendingDecisionCount} pending
+                  </s-text>
+                </s-paragraph>
+              ))}
+            </s-box>
+          )}
+
+          <s-box padding="base" borderWidth="base" borderRadius="base">
+            <s-heading>Recent ledger activity</s-heading>
+            {data.recentCaseEvents.length ? (
+              data.recentCaseEvents.map((event) => (
+                <s-paragraph key={event.id}>
+                  <s-link href={`/app/cases/${event.operationCaseId}`}>
+                    {event.caseSummary}
+                  </s-link>
+                  <s-text> · {event.title}</s-text>
+                  {event.message && <s-text> · {event.message}</s-text>}
+                </s-paragraph>
+              ))
+            ) : (
+              <EmptyState>No case ledger activity yet.</EmptyState>
+            )}
+          </s-box>
         </s-stack>
       </s-section>
 
@@ -480,6 +623,21 @@ export default function Index() {
 
       <s-section heading="Demo fallback actions">
         <s-stack direction="inline" gap="base">
+          <Form method="post">
+            <input
+              type="hidden"
+              name="intent"
+              value="create-demo-operational-cases"
+            />
+            <s-button
+              type="submit"
+              variant="secondary"
+              {...(isSubmitting ? { loading: true } : {})}
+              disabled={!data.configured}
+            >
+              Demo: Create Operational Cases
+            </s-button>
+          </Form>
           <Form method="post">
             <input type="hidden" name="intent" value="create-demo-order" />
             <s-button

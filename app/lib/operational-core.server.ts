@@ -1,4 +1,15 @@
 import type { QueryExecutor } from "./foundation-db.server";
+import {
+  addCaseEvent,
+  createOperationCase,
+  linkCaseObject,
+} from "./operational-case.server";
+import {
+  calculateMaterialDemand,
+  ensureItemForShopifyVariant,
+  getAvailableQuantity,
+  type MaterialDemandLine,
+} from "./material-planning.server";
 
 export interface TenantContext {
   tenantId: string;
@@ -6,6 +17,7 @@ export interface TenantContext {
 }
 
 export interface ShopifyOrderLineInput {
+  shopifyProductId?: string | null;
   shopifyVariantId?: string | null;
   sku?: string | null;
   title: string;
@@ -51,6 +63,7 @@ export interface OperationsDashboard {
   };
   operationsOrders: Array<{
     id: string;
+    operationCaseId: string | null;
     orderNumber: string | null;
     status: string;
     originType: string;
@@ -129,6 +142,7 @@ type OperationsOrderLineRow = {
   id: string;
   tenant_id: string;
   operations_order_id: string;
+  item_id: string | null;
   shopify_variant_id: string | null;
   sku: string | null;
   title: string;
@@ -317,6 +331,233 @@ export function buildDemoShopifyOrderPayload(shopDomain: string): ShopifyOrderIm
   };
 }
 
+async function ensureOperationCaseForOrder(
+  db: QueryExecutor,
+  ctx: TenantContext,
+  input: {
+    operationsOrderId: string;
+    orderNumber?: string | null;
+    originType: string;
+    originRefId?: string | null;
+    shopifyOrderId?: string | null;
+  },
+) {
+  const operationCase = await createOperationCase(db, ctx, {
+    caseType: "general_operations_case",
+    status: "open",
+    priority: "normal",
+    summary: `Work ${input.orderNumber ?? input.operationsOrderId}`,
+    description: "Operational work case created for an Operations Order.",
+    primaryShopifyObjectType: input.shopifyOrderId ? "shopify_order" : null,
+    primaryShopifyObjectId: input.shopifyOrderId ?? null,
+    primaryShopifyObjectGid: input.shopifyOrderId?.startsWith("gid://")
+      ? input.shopifyOrderId
+      : null,
+    idempotencyKey: `operations_order_case:${input.operationsOrderId}`,
+  });
+
+  await db.query(
+    `
+      update public.operations_orders
+      set operation_case_id = $3,
+          updated_at = now()
+      where tenant_id = $1
+        and id = $2
+        and operation_case_id is distinct from $3
+    `,
+    [ctx.tenantId, input.operationsOrderId, operationCase.operationCaseId],
+  );
+  await linkCaseObject(db, ctx, {
+    operationCaseId: operationCase.operationCaseId,
+    linkedObjectType: "operations_order",
+    linkedObjectId: input.operationsOrderId,
+    relationType: "primary_work_object",
+  });
+
+  if (input.shopifyOrderId) {
+    await linkCaseObject(db, ctx, {
+      operationCaseId: operationCase.operationCaseId,
+      linkedObjectType: "shopify_order",
+      linkedObjectId: input.shopifyOrderId,
+      linkedObjectGid: input.shopifyOrderId.startsWith("gid://")
+        ? input.shopifyOrderId
+        : null,
+      relationType: "source_order",
+    });
+  }
+
+  await addCaseEvent(db, ctx, {
+    operationCaseId: operationCase.operationCaseId,
+    eventType: "OPERATIONS_ORDER_LINKED",
+    title: "Operations Order linked",
+    message: input.orderNumber ?? input.operationsOrderId,
+    source: "operations_orders",
+    sourceRef: input.operationsOrderId,
+    idempotencyKey: `operations_order_linked:${input.operationsOrderId}`,
+    metadata: {
+      operations_order_id: input.operationsOrderId,
+      origin_type: input.originType,
+      origin_ref_id: input.originRefId ?? null,
+    },
+  });
+
+  return operationCase.operationCaseId;
+}
+
+async function createOrUpdatePurchaseNeedForDemand(
+  db: QueryExecutor,
+  ctx: TenantContext,
+  input: {
+    operationsOrderId: string;
+    operationsOrderLineId: string;
+    itemId?: string | null;
+    shopifyVariantId?: string | null;
+    sku?: string | null;
+    title: string;
+    quantityNeeded: number;
+  },
+) {
+  const existingNeedResult = await db.query<PurchaseNeedRow & { item_id: string | null }>(
+    `
+      select *
+      from public.purchase_needs
+      where tenant_id = $1
+        and operations_order_line_id = $2
+        and coalesce(item_id, '00000000-0000-0000-0000-000000000000'::uuid)
+            = coalesce($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+        and status in ('OPEN', 'LINKED_TO_PO', 'PARTIALLY_COVERED')
+      limit 1
+    `,
+    [ctx.tenantId, input.operationsOrderLineId, input.itemId ?? null],
+  );
+  const existingNeed = existingNeedResult.rows[0];
+
+  if (existingNeed) {
+    if (existingNeed.status === "OPEN") {
+      await db.query(
+        `
+          update public.purchase_needs
+          set quantity_needed = $3,
+              updated_at = now()
+          where tenant_id = $1
+            and id = $2
+        `,
+        [ctx.tenantId, existingNeed.id, input.quantityNeeded],
+      );
+    }
+
+    return { purchaseNeedId: existingNeed.id, alreadyCreated: true };
+  }
+
+  const purchaseNeedResult = await db.query<{ id: string }>(
+    `
+      insert into public.purchase_needs (
+        tenant_id,
+        operations_order_id,
+        operations_order_line_id,
+        item_id,
+        shopify_variant_id,
+        sku,
+        title,
+        quantity_needed,
+        status
+      )
+      values ($1, $2, $3, $4, $5, $6, $7, $8, 'OPEN')
+      returning id
+    `,
+    [
+      ctx.tenantId,
+      input.operationsOrderId,
+      input.operationsOrderLineId,
+      input.itemId ?? null,
+      input.shopifyVariantId ?? null,
+      input.sku ?? null,
+      input.title,
+      input.quantityNeeded,
+    ],
+  );
+
+  return {
+    purchaseNeedId: purchaseNeedResult.rows[0]!.id,
+    alreadyCreated: false,
+  };
+}
+
+async function createOrUpdateProductionNeedForDemand(
+  db: QueryExecutor,
+  ctx: TenantContext,
+  input: {
+    itemId: string;
+    requiredQuantity: number;
+    referenceType: "operations_order";
+    referenceId: string;
+  },
+) {
+  const existing = await db.query<{ id: string }>(
+    `
+      select id
+      from public.production_needs
+      where tenant_id = $1
+        and item_id = $2
+        and reference_type = $3
+        and reference_id = $4
+        and status = 'PENDING'
+      limit 1
+    `,
+    [
+      ctx.tenantId,
+      input.itemId,
+      input.referenceType,
+      input.referenceId,
+    ],
+  );
+
+  if (existing.rows[0]) {
+    await db.query(
+      `
+        update public.production_needs
+        set required_quantity = $3,
+            updated_at = now()
+        where tenant_id = $1
+          and id = $2
+      `,
+      [ctx.tenantId, existing.rows[0].id, input.requiredQuantity],
+    );
+
+    return {
+      productionNeedId: existing.rows[0].id,
+      alreadyCreated: true,
+    };
+  }
+
+  const result = await db.query<{ id: string }>(
+    `
+      insert into public.production_needs (
+        tenant_id,
+        item_id,
+        required_quantity,
+        status,
+        reference_type,
+        reference_id
+      )
+      values ($1, $2, $3, 'PENDING', $4, $5)
+      returning id
+    `,
+    [
+      ctx.tenantId,
+      input.itemId,
+      input.requiredQuantity,
+      input.referenceType,
+      input.referenceId,
+    ],
+  );
+
+  return {
+    productionNeedId: result.rows[0]!.id,
+    alreadyCreated: false,
+  };
+}
+
 export async function getOperationsDashboard(
   db: QueryExecutor,
   ctx: TenantContext,
@@ -353,13 +594,14 @@ export async function getOperationsDashboard(
   );
   const ordersResult = await db.query<{
     id: string;
+    operation_case_id: string | null;
     order_number: string | null;
     status: string;
     origin_type: string;
     created_at: Date;
   }>(
     `
-      select id, order_number, status, origin_type, created_at
+      select id, operation_case_id, order_number, status, origin_type, created_at
       from public.operations_orders
       where tenant_id = $1
       order by created_at desc
@@ -528,6 +770,7 @@ export async function getOperationsDashboard(
     },
     operationsOrders: ordersResult.rows.map((order) => ({
       id: order.id,
+      operationCaseId: order.operation_case_id,
       orderNumber: order.order_number,
       status: order.status,
       originType: order.origin_type,
@@ -599,9 +842,17 @@ export async function importShopifyOrder(
     tenantId: tenant.id,
     shopDomain: normalizeShopDomain(input.shopDomain),
   };
-  const existing = await db.query<{ operations_order_id: string; status: string }>(
+  const existing = await db.query<{
+    operations_order_id: string;
+    operation_case_id: string | null;
+    origin_ref_id: string | null;
+    status: string;
+  }>(
     `
-      select operations_orders.id as operations_order_id, operations_orders.status
+      select operations_orders.id as operations_order_id,
+             operations_orders.operation_case_id,
+             operations_orders.origin_ref_id,
+             operations_orders.status
       from public.shopify_order_refs
       join public.operations_orders
         on operations_orders.origin_ref_id = shopify_order_refs.id
@@ -613,8 +864,21 @@ export async function importShopifyOrder(
   );
 
   if (existing.rows[0]) {
+    let operationCaseId = existing.rows[0].operation_case_id;
+
+    if (!existing.rows[0].operation_case_id) {
+      operationCaseId = await ensureOperationCaseForOrder(db, ctx, {
+        operationsOrderId: existing.rows[0].operations_order_id,
+        orderNumber: input.shopifyOrderName ?? null,
+        originType: "SHOPIFY_ORDER",
+        originRefId: existing.rows[0].origin_ref_id,
+        shopifyOrderId: input.shopifyOrderId,
+      });
+    }
+
     return {
       operationsOrderId: existing.rows[0].operations_order_id,
+      operationCaseId,
       status: existing.rows[0].status,
       alreadyImported: true,
     };
@@ -666,24 +930,45 @@ export async function importShopifyOrder(
     ],
   );
   const operationsOrder = operationsOrderResult.rows[0]!;
+  const operationCaseId = await ensureOperationCaseForOrder(db, ctx, {
+    operationsOrderId: operationsOrder.id,
+    orderNumber: input.shopifyOrderName ?? null,
+    originType: "SHOPIFY_ORDER",
+    originRefId: orderRefId,
+    shopifyOrderId: input.shopifyOrderId,
+  });
 
   for (const line of input.lines) {
+    const item = line.shopifyVariantId
+      ? await ensureItemForShopifyVariant(db, ctx, {
+          shopifyProductId: line.shopifyProductId ?? null,
+          shopifyVariantId: line.shopifyVariantId,
+          sku: line.sku,
+          itemType: "product",
+          isSellable: true,
+          isPurchasable: false,
+          isProducible: false,
+        })
+      : null;
+
     await db.query(
       `
         insert into public.operations_order_lines (
           tenant_id,
           operations_order_id,
+          item_id,
           shopify_variant_id,
           sku,
           title,
           quantity_required,
           supply_status
         )
-        values ($1, $2, $3, $4, $5, $6, 'UNCHECKED')
+        values ($1, $2, $3, $4, $5, $6, $7, 'UNCHECKED')
       `,
       [
         tenant.id,
         operationsOrder.id,
+        item?.itemId ?? null,
         line.shopifyVariantId ?? null,
         line.sku ?? null,
         line.title,
@@ -736,6 +1021,7 @@ export async function importShopifyOrder(
 
   return {
     operationsOrderId: operationsOrder.id,
+    operationCaseId,
     status: operationsOrder.status,
     alreadyImported: false,
   };
@@ -844,9 +1130,13 @@ export async function runSupplyCheck(
   ctx: TenantContext,
   operationsOrderId: string,
 ) {
-  const orderResult = await db.query<{ id: string; status: string }>(
+  const orderResult = await db.query<{
+    id: string;
+    status: string;
+    operation_case_id: string | null;
+  }>(
     `
-      select id, status
+      select id, status, operation_case_id
       from public.operations_orders
       where tenant_id = $1
         and id = $2
@@ -877,18 +1167,146 @@ export async function runSupplyCheck(
 
   const createdPurchaseNeeds: Array<{ id: string; sku: string | null; quantityNeeded: number }> =
     [];
+  const createdProductionNeeds: Array<{ id: string; itemId: string; quantityNeeded: number }> =
+    [];
   const lineResults = [];
+  const materialDemands = await calculateMaterialDemand(db, ctx, operationsOrderId);
+
+  async function recordPurchaseNeed(input: {
+    line: OperationsOrderLineRow;
+    demand?: MaterialDemandLine;
+    quantityNeeded: number;
+  }) {
+    const purchaseNeed = await createOrUpdatePurchaseNeedForDemand(db, ctx, {
+      operationsOrderId,
+      operationsOrderLineId: input.line.id,
+      itemId: input.demand?.itemId ?? input.line.item_id,
+      shopifyVariantId: input.demand?.shopifyVariantId ?? input.line.shopify_variant_id,
+      sku: input.demand?.sku ?? input.line.sku,
+      title: input.demand?.title ?? input.line.title,
+      quantityNeeded: input.quantityNeeded,
+    });
+
+    if (purchaseNeed.alreadyCreated) {
+      return;
+    }
+
+    createdPurchaseNeeds.push({
+      id: purchaseNeed.purchaseNeedId,
+      sku: input.demand?.sku ?? input.line.sku,
+      quantityNeeded: input.quantityNeeded,
+    });
+    await createDomainEvent(db, ctx, {
+      eventType: "PURCHASE_NEED_CREATED",
+      aggregateType: "purchase_need",
+      aggregateId: purchaseNeed.purchaseNeedId,
+      payload: {
+        purchase_need_id: purchaseNeed.purchaseNeedId,
+        operations_order_id: operationsOrderId,
+        operations_order_line_id: input.line.id,
+        item_id: input.demand?.itemId ?? input.line.item_id,
+        sku: input.demand?.sku ?? input.line.sku,
+        quantity_needed: input.quantityNeeded,
+      },
+    });
+
+    if (order.operation_case_id) {
+      await addCaseEvent(db, ctx, {
+        operationCaseId: order.operation_case_id,
+        eventType: "PURCHASE_NEED_CREATED",
+        title: "Purchase need created",
+        message: `${input.demand?.sku ?? input.line.sku ?? input.line.title}: ${
+          input.quantityNeeded
+        }`,
+        source: "purchase_needs",
+        sourceRef: purchaseNeed.purchaseNeedId,
+        idempotencyKey: `case_purchase_need_created:${purchaseNeed.purchaseNeedId}`,
+        metadata: {
+          purchase_need_id: purchaseNeed.purchaseNeedId,
+          operations_order_line_id: input.line.id,
+          item_id: input.demand?.itemId ?? input.line.item_id,
+          quantity_needed: input.quantityNeeded,
+        },
+      });
+    }
+  }
+
+  async function recordProductionNeed(input: {
+    itemId: string;
+    quantityNeeded: number;
+    line: OperationsOrderLineRow;
+    demand?: MaterialDemandLine;
+  }) {
+    const productionNeed = await createOrUpdateProductionNeedForDemand(db, ctx, {
+      itemId: input.itemId,
+      requiredQuantity: input.quantityNeeded,
+      referenceType: "operations_order",
+      referenceId: operationsOrderId,
+    });
+
+    if (!productionNeed.alreadyCreated) {
+      createdProductionNeeds.push({
+        id: productionNeed.productionNeedId,
+        itemId: input.itemId,
+        quantityNeeded: input.quantityNeeded,
+      });
+      await createDomainEvent(db, ctx, {
+        eventType: "PRODUCTION_NEED_CREATED",
+        aggregateType: "production_need",
+        aggregateId: productionNeed.productionNeedId,
+        payload: {
+          production_need_id: productionNeed.productionNeedId,
+          operations_order_id: operationsOrderId,
+          operations_order_line_id: input.line.id,
+          item_id: input.itemId,
+          quantity_needed: input.quantityNeeded,
+        },
+      });
+    }
+
+    if (order.operation_case_id) {
+      await addCaseEvent(db, ctx, {
+        operationCaseId: order.operation_case_id,
+        eventType: "PRODUCTION_NEED_CREATED",
+        title: "Production need created",
+        message: `${input.demand?.sku ?? input.line.sku ?? input.line.title}: ${
+          input.quantityNeeded
+        }`,
+        source: "production_needs",
+        sourceRef: productionNeed.productionNeedId,
+        idempotencyKey: `case_production_need_created:${productionNeed.productionNeedId}`,
+        metadata: {
+          production_need_id: productionNeed.productionNeedId,
+          operations_order_line_id: input.line.id,
+          item_id: input.itemId,
+          quantity_needed: input.quantityNeeded,
+        },
+      });
+    }
+  }
 
   for (const line of linesResult.rows) {
     const required = toNumber(line.quantity_required);
     const currentReserved = toNumber(line.quantity_reserved);
     const requiredRemaining = Math.max(required - currentReserved, 0);
-    const balance = await getInventoryBalance(db, ctx, {
-      shopifyVariantId: line.shopify_variant_id,
-      sku: line.sku,
-    });
+    const lineDemands = materialDemands.filter(
+      (demand) => demand.operationsOrderLineId === line.id,
+    );
+    const parentDemand = lineDemands.find(
+      (demand) =>
+        demand.demandType === "direct" || demand.demandType === "production",
+    );
+    const availableQuantity =
+      line.item_id && parentDemand
+        ? await getAvailableQuantity(db, ctx, line.item_id)
+        : (
+            await getInventoryBalance(db, ctx, {
+              shopifyVariantId: line.shopify_variant_id,
+              sku: line.sku,
+            })
+          ).availableQuantity;
     const reserveQuantity = Math.min(
-      Math.max(balance.availableQuantity, 0),
+      Math.max(availableQuantity, 0),
       requiredRemaining,
     );
 
@@ -938,8 +1356,11 @@ export async function runSupplyCheck(
 
     const quantityReserved = currentReserved + reserveQuantity;
     const quantityMissing = Math.max(required - quantityReserved, 0);
+    const componentShortages = lineDemands.filter(
+      (demand) => demand.demandType === "component" && demand.shortageQuantity > 0,
+    );
     const supplyStatus =
-      quantityMissing === 0
+      quantityMissing === 0 && componentShortages.length === 0
         ? "RESERVED"
         : quantityReserved > 0
           ? "PARTIALLY_RESERVED"
@@ -959,77 +1380,35 @@ export async function runSupplyCheck(
     );
 
     if (quantityMissing > 0) {
-      const existingNeedResult = await db.query<PurchaseNeedRow>(
-        `
-          select *
-          from public.purchase_needs
-          where tenant_id = $1
-            and operations_order_line_id = $2
-            and status in ('OPEN', 'LINKED_TO_PO', 'PARTIALLY_COVERED')
-          limit 1
-        `,
-        [ctx.tenantId, line.id],
-      );
-
-      const existingNeed = existingNeedResult.rows[0];
-
-      if (existingNeed) {
-        if (existingNeed.status === "OPEN") {
-          await db.query(
-            `
-              update public.purchase_needs
-              set quantity_needed = $3,
-                  updated_at = now()
-              where tenant_id = $1
-                and id = $2
-            `,
-            [ctx.tenantId, existingNeed.id, quantityMissing],
-          );
-        }
+      if (parentDemand?.itemType === "assembly") {
+        await recordProductionNeed({
+          itemId: parentDemand.itemId,
+          quantityNeeded: quantityMissing,
+          line,
+          demand: parentDemand,
+        });
       } else {
-        const purchaseNeedResult = await db.query<{ id: string }>(
-          `
-            insert into public.purchase_needs (
-              tenant_id,
-              operations_order_id,
-              operations_order_line_id,
-              shopify_variant_id,
-              sku,
-              title,
-              quantity_needed,
-              status
-            )
-            values ($1, $2, $3, $4, $5, $6, $7, 'OPEN')
-            returning id
-          `,
-          [
-            ctx.tenantId,
-            operationsOrderId,
-            line.id,
-            line.shopify_variant_id,
-            line.sku,
-            line.title,
-            quantityMissing,
-          ],
-        );
-        const purchaseNeedId = purchaseNeedResult.rows[0]!.id;
-
-        createdPurchaseNeeds.push({
-          id: purchaseNeedId,
-          sku: line.sku,
+        await recordPurchaseNeed({
+          line,
+          demand: parentDemand,
           quantityNeeded: quantityMissing,
         });
-        await createDomainEvent(db, ctx, {
-          eventType: "PURCHASE_NEED_CREATED",
-          aggregateType: "purchase_need",
-          aggregateId: purchaseNeedId,
-          payload: {
-            purchase_need_id: purchaseNeedId,
-            operations_order_id: operationsOrderId,
-            operations_order_line_id: line.id,
-            sku: line.sku,
-            quantity_needed: quantityMissing,
-          },
+      }
+    }
+
+    for (const demand of componentShortages) {
+      if (demand.itemType === "assembly") {
+        await recordProductionNeed({
+          itemId: demand.itemId,
+          quantityNeeded: demand.shortageQuantity,
+          line,
+          demand,
+        });
+      } else {
+        await recordPurchaseNeed({
+          line,
+          demand,
+          quantityNeeded: demand.shortageQuantity,
         });
       }
     }
@@ -1038,7 +1417,12 @@ export async function runSupplyCheck(
       operationsOrderLineId: line.id,
       required,
       reserved: quantityReserved,
-      missing: quantityMissing,
+      missing:
+        quantityMissing +
+        componentShortages.reduce(
+          (total, demand) => total + demand.shortageQuantity,
+          0,
+        ),
       supplyStatus,
     });
   }
@@ -1074,10 +1458,27 @@ export async function runSupplyCheck(
     },
   });
 
+  if (order.operation_case_id) {
+    await addCaseEvent(db, ctx, {
+      operationCaseId: order.operation_case_id,
+      eventType: "SUPPLY_CHECK_COMPLETED",
+      title: "Supply check completed",
+      message: status,
+      source: "operations_orders",
+      sourceRef: operationsOrderId,
+      idempotencyKey: `case_supply_check_completed:${operationsOrderId}:${status}`,
+      metadata: {
+        operations_order_id: operationsOrderId,
+        result: status,
+      },
+    });
+  }
+
   return {
     operationsOrderId,
     status,
     createdPurchaseNeeds,
+    createdProductionNeeds,
     lines: lineResults,
   };
 }
@@ -1263,6 +1664,43 @@ export async function createPurchaseOrderFromNeeds(
     },
   });
 
+  const purchaseOrderCaseResult = await db.query<{ operation_case_id: string }>(
+    `
+      select distinct operations_orders.operation_case_id
+      from public.purchase_needs
+      join public.operations_orders
+        on operations_orders.id = purchase_needs.operations_order_id
+      where purchase_needs.tenant_id = $1
+        and purchase_needs.id = any($2::uuid[])
+        and operations_orders.operation_case_id is not null
+      limit 1
+    `,
+    [ctx.tenantId, input.purchaseNeedIds],
+  );
+  const purchaseOrderCaseId = purchaseOrderCaseResult.rows[0]?.operation_case_id;
+
+  if (purchaseOrderCaseId) {
+    await addCaseEvent(db, ctx, {
+      operationCaseId: purchaseOrderCaseId,
+      eventType: "PURCHASE_ORDER_CREATED",
+      title: "Purchase Order created",
+      message: purchaseOrder.id,
+      source: "purchase_orders",
+      sourceRef: purchaseOrder.id,
+      idempotencyKey: `case_purchase_order_created:${purchaseOrder.id}`,
+      metadata: {
+        purchase_order_id: purchaseOrder.id,
+        supplier_id: input.supplierId,
+      },
+    });
+    await linkCaseObject(db, ctx, {
+      operationCaseId: purchaseOrderCaseId,
+      linkedObjectType: "purchase_order",
+      linkedObjectId: purchaseOrder.id,
+      relationType: "procurement",
+    });
+  }
+
   if (idempotencyKey) {
     await db.query(
       `
@@ -1361,6 +1799,33 @@ export async function sendPurchaseOrder(
       po_number: purchaseOrder.po_number,
     },
   });
+  const caseResult = await db.query<{ operation_case_id: string }>(
+    `
+      select distinct operations_orders.operation_case_id
+      from public.purchase_order_lines
+      join public.purchase_needs
+        on purchase_needs.id = purchase_order_lines.purchase_need_id
+      join public.operations_orders
+        on operations_orders.id = purchase_needs.operations_order_id
+      where purchase_order_lines.tenant_id = $1
+        and purchase_order_lines.purchase_order_id = $2
+        and operations_orders.operation_case_id is not null
+      limit 1
+    `,
+    [ctx.tenantId, purchaseOrder.id],
+  );
+
+  if (caseResult.rows[0]?.operation_case_id) {
+    await addCaseEvent(db, ctx, {
+      operationCaseId: caseResult.rows[0].operation_case_id,
+      eventType: "PURCHASE_ORDER_SENT",
+      title: "Purchase Order sent",
+      message: purchaseOrder.po_number ?? purchaseOrder.id,
+      source: "purchase_orders",
+      sourceRef: purchaseOrder.id,
+      idempotencyKey: `case_purchase_order_sent:${purchaseOrder.id}`,
+    });
+  }
 
   return {
     purchaseOrderId: purchaseOrder.id,
@@ -1663,6 +2128,43 @@ export async function postGoodsReceipt(
       lines: eventLines,
     },
   });
+  const goodsReceiptCaseResult = await db.query<{ operation_case_id: string }>(
+    `
+      select distinct operations_orders.operation_case_id
+      from public.purchase_order_lines
+      join public.purchase_needs
+        on purchase_needs.id = purchase_order_lines.purchase_need_id
+      join public.operations_orders
+        on operations_orders.id = purchase_needs.operations_order_id
+      where purchase_order_lines.tenant_id = $1
+        and purchase_order_lines.purchase_order_id = $2
+        and operations_orders.operation_case_id is not null
+      limit 1
+    `,
+    [ctx.tenantId, input.purchaseOrderId],
+  );
+
+  if (goodsReceiptCaseResult.rows[0]?.operation_case_id) {
+    await addCaseEvent(db, ctx, {
+      operationCaseId: goodsReceiptCaseResult.rows[0].operation_case_id,
+      eventType: "GOODS_RECEIVED",
+      title: "Goods received",
+      message: purchaseOrderStatus,
+      source: "goods_receipts",
+      sourceRef: goodsReceiptId,
+      idempotencyKey: `case_goods_received:${goodsReceiptId}`,
+      metadata: {
+        goods_receipt_id: goodsReceiptId,
+        purchase_order_id: input.purchaseOrderId,
+      },
+    });
+    await linkCaseObject(db, ctx, {
+      operationCaseId: goodsReceiptCaseResult.rows[0].operation_case_id,
+      linkedObjectType: "goods_receipt",
+      linkedObjectId: goodsReceiptId,
+      relationType: "receipt",
+    });
+  }
 
   if (idempotencyKey) {
     await db.query(
