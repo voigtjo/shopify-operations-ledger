@@ -15,6 +15,7 @@ import {
   runDemoKitMrpPreview,
 } from "../lib/material-planning.server";
 import { loadPurchaseNeedsSummary } from "../lib/purchase-needs.server";
+import { loadPurchaseOrderDashboardSummary } from "../lib/purchase-orders.server";
 import { formatQuantity, formatStatus, shortReference } from "../lib/ui-format";
 
 type ActionResult = {
@@ -42,6 +43,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       missingSupplierPurchaseNeedCount: 0,
       preferredSupplierAvailablePurchaseNeedCount: 0,
       readyForPoDraftPurchaseNeedCount: 0,
+      draftPurchaseOrderCount: 0,
+      sentPurchaseOrderCount: 0,
+      acknowledgedPurchaseOrderCount: 0,
       openProductionNeedCount: 0,
       demoPreview: null,
       hasDemoItems: false,
@@ -49,13 +53,22 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     };
   }
 
-  const [items, boms, runs, needs, purchaseNeedSummary, demoPreview] =
+  const [
+    items,
+    boms,
+    runs,
+    needs,
+    purchaseNeedSummary,
+    purchaseOrderSummary,
+    demoPreview,
+  ] =
     await Promise.all([
       loadItemList(context.pool, context.ctx, { limit: 200 }),
       loadBomList(context.pool, context.ctx),
       loadMrpRunList(context.pool, context.ctx, { limit: 1 }),
       loadNeedsBoard(context.pool, context.ctx),
       loadPurchaseNeedsSummary(context.pool, context.ctx),
+      loadPurchaseOrderDashboardSummary(context.pool, context.ctx),
       loadLatestDemoKitMrpPreview(context.pool, context.ctx),
     ]);
 
@@ -72,6 +85,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       purchaseNeedSummary.preferredSupplierAvailablePurchaseNeeds,
     readyForPoDraftPurchaseNeedCount:
       purchaseNeedSummary.readyForPoDraftPurchaseNeeds,
+    draftPurchaseOrderCount: purchaseOrderSummary.draftPurchaseOrders,
+    sentPurchaseOrderCount: purchaseOrderSummary.sentPurchaseOrders,
+    acknowledgedPurchaseOrderCount:
+      purchaseOrderSummary.acknowledgedPurchaseOrders,
     openProductionNeedCount: needs.productionNeeds.filter((need) =>
       ["pending", "PENDING"].includes(need.status),
     ).length,
@@ -200,6 +217,14 @@ export default function Dashboard() {
             <s-box padding="base" borderWidth="base" borderRadius="base">
               <s-heading>{data.openProductionNeedCount}</s-heading>
               <s-paragraph>Open production needs</s-paragraph>
+            </s-box>
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{data.draftPurchaseOrderCount}</s-heading>
+              <s-paragraph>Draft purchase orders</s-paragraph>
+            </s-box>
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{data.sentPurchaseOrderCount}</s-heading>
+              <s-paragraph>Sent purchase orders</s-paragraph>
             </s-box>
           </s-stack>
         </s-stack>
@@ -346,6 +371,26 @@ export default function Dashboard() {
                 for PO draft preview.
               </s-paragraph>
               <s-link href="/app/needs/po-draft">Prepare PO Draft</s-link>
+            </s-box>
+          )}
+          {data.draftPurchaseOrderCount > 0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                {data.draftPurchaseOrderCount} draft purchase order
+                {data.draftPurchaseOrderCount === 1 ? "" : "s"} ready to send.
+              </s-paragraph>
+              <s-link href="/app/purchase-orders">Open Purchase Orders</s-link>
+            </s-box>
+          )}
+          {data.sentPurchaseOrderCount + data.acknowledgedPurchaseOrderCount >
+            0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                {data.sentPurchaseOrderCount} sent and{" "}
+                {data.acknowledgedPurchaseOrderCount} acknowledged purchase
+                orders.
+              </s-paragraph>
+              <s-link href="/app/purchase-orders">Review Purchase Orders</s-link>
             </s-box>
           )}
           {data.openProductionNeedCount > 0 && (

@@ -33,6 +33,14 @@ import {
   setSupplierActive,
   updateSupplier,
 } from "../../app/lib/purchase-needs.server";
+import {
+  cancelPurchaseOrder,
+  createPurchaseOrdersFromDraftPreview,
+  listPurchaseOrders,
+  loadPurchaseOrderDetail,
+  markPurchaseOrderAcknowledged,
+  markPurchaseOrderSent,
+} from "../../app/lib/purchase-orders.server";
 
 const connectionString = process.env.OPERATIONS_LEDGER_DATABASE_URL;
 const describeIfDatabase = connectionString ? describe : describe.skip;
@@ -683,6 +691,110 @@ describeIfDatabase("item, BOM, and MRP foundation against local Supabase", () =>
       }),
     );
     expect(counts.rows[0]).toEqual({ purchase_order_count: "0" });
+  });
+
+  it("creates purchase orders from ready purchase needs by supplier idempotently and transitions status", async () => {
+    await createDemoKitBom(pool, ctx);
+    const preview = await previewDemoKitMrp(pool, ctx, 1);
+    await commitMrpRunNeeds(pool, ctx, {
+      mrpRunId: preview!.mrpRunId!,
+    });
+    const supplierA = await createSupplier(pool, ctx, {
+      name: "PO Supplier A",
+    });
+    const supplierB = await createSupplier(pool, ctx, {
+      name: "PO Supplier B",
+    });
+    const needs = await pool.query<{ id: string; sku: string }>(
+      `
+        select id, sku
+        from public.purchase_needs
+        where tenant_id = $1
+        order by sku asc
+      `,
+      [ctx.tenantId],
+    );
+
+    for (const need of needs.rows) {
+      await assignSupplierToPurchaseNeed(pool, ctx, {
+        purchaseNeedId: need.id,
+        supplierId: need.sku === "BOX" ? supplierA.id : supplierB.id,
+      });
+      await markPurchaseNeedReadyForPo(pool, ctx, {
+        purchaseNeedId: need.id,
+      });
+    }
+
+    const first = await createPurchaseOrdersFromDraftPreview(pool, ctx);
+    const second = await createPurchaseOrdersFromDraftPreview(pool, ctx);
+    const purchaseOrders = await listPurchaseOrders(pool, ctx);
+    const firstDetail = await loadPurchaseOrderDetail(
+      pool,
+      ctx,
+      first.createdPurchaseOrders[0]!.id,
+    );
+    const board = await listPurchaseNeedsBoard(pool, ctx, { filter: "all" });
+    const sent = await markPurchaseOrderSent(pool, ctx, {
+      purchaseOrderId: first.createdPurchaseOrders[0]!.id,
+    });
+    const acknowledged = await markPurchaseOrderAcknowledged(pool, ctx, {
+      purchaseOrderId: first.createdPurchaseOrders[0]!.id,
+    });
+    const cancelled = await cancelPurchaseOrder(pool, ctx, {
+      purchaseOrderId: first.createdPurchaseOrders[1]!.id,
+    });
+    const counts = await pool.query<{
+      purchase_order_count: string;
+      purchase_order_line_count: string;
+      goods_receipt_count: string;
+      inventory_movement_count: string;
+      qc_table: string | null;
+      warehouse_table: string | null;
+      accounting_table: string | null;
+    }>(
+      `
+        select
+          (select count(*)::text from public.purchase_orders where tenant_id = $1) as purchase_order_count,
+          (select count(*)::text from public.purchase_order_lines where tenant_id = $1) as purchase_order_line_count,
+          (select count(*)::text from public.goods_receipts where tenant_id = $1) as goods_receipt_count,
+          (select count(*)::text from public.inventory_movements where tenant_id = $1) as inventory_movement_count,
+          to_regclass('public.qc_checks')::text as qc_table,
+          to_regclass('public.warehouse_tasks')::text as warehouse_table,
+          to_regclass('public.accounting_event_candidates')::text as accounting_table
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(first.createdPurchaseOrders).toHaveLength(2);
+    expect(first.existingPurchaseOrders).toHaveLength(0);
+    expect(second.createdPurchaseOrders).toHaveLength(0);
+    expect(second.existingPurchaseOrders).toHaveLength(2);
+    expect(purchaseOrders).toHaveLength(2);
+    expect(firstDetail.lines.length).toBeGreaterThan(0);
+    expect(firstDetail.lines.every((line) => line.sourcePurchaseNeedId)).toBe(
+      true,
+    );
+    expect(board.purchaseNeeds.every((need) => need.purchaseOrderId)).toBe(true);
+    expect(board.purchaseNeeds.every((need) => need.status === "linked_to_po")).toBe(
+      true,
+    );
+    expect(sent.status).toBe("sent");
+    expect(acknowledged.status).toBe("acknowledged");
+    expect(cancelled.status).toBe("cancelled");
+    await expect(
+      markPurchaseOrderAcknowledged(pool, ctx, {
+        purchaseOrderId: first.createdPurchaseOrders[1]!.id,
+      }),
+    ).rejects.toThrow("purchase_order_cancelled");
+    expect(counts.rows[0]).toEqual({
+      purchase_order_count: "2",
+      purchase_order_line_count: "3",
+      goods_receipt_count: "0",
+      inventory_movement_count: "0",
+      qc_table: null,
+      warehouse_table: null,
+      accounting_table: null,
+    });
   });
 
   it("runs demo kit supply check without duplicate purchase or production needs", async () => {

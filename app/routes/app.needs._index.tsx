@@ -293,6 +293,20 @@ export default function NeedsIndex() {
                         }`
                       : "Not assigned"}
                   </s-paragraph>
+                  <s-paragraph>
+                    Purchase order:{" "}
+                    {need.purchaseOrderId ? (
+                      <s-link href={`/app/purchase-orders/${need.purchaseOrderId}`}>
+                        {need.purchaseOrderDisplayNumber ??
+                          shortReference(need.purchaseOrderId)}
+                        {need.purchaseOrderStatus
+                          ? ` (${formatStatus(need.purchaseOrderStatus)})`
+                          : ""}
+                      </s-link>
+                    ) : (
+                      "Not created yet"
+                    )}
+                  </s-paragraph>
                   {!need.readyForPoDraftAt ? (
                     <s-stack direction="block" gap="small">
                       {!need.assignedSupplierId && need.recommendedSupplierId && (

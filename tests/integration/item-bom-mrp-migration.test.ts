@@ -19,6 +19,10 @@ const purchaseNeedWorkflowMigration = readFileSync(
   resolve("supabase/migrations/20260501130000_purchase_need_supplier_workflow.sql"),
   "utf8",
 ).toLowerCase();
+const purchaseOrderLifecycleMigration = readFileSync(
+  resolve("supabase/migrations/20260501140000_purchase_order_lifecycle.sql"),
+  "utf8",
+).toLowerCase();
 
 describe("item, BOM, and MRP foundation migration", () => {
   it("creates item and BOM foundation tables", () => {
@@ -79,5 +83,20 @@ describe("item, BOM, and MRP foundation migration", () => {
     expect(purchaseNeedWorkflowMigration).toContain("supplier_items_one_preferred_active_item_uidx");
     expect(purchaseNeedWorkflowMigration).not.toContain("create table public.purchase_orders");
     expect(purchaseNeedWorkflowMigration).not.toContain("goods_receipts");
+  });
+
+  it("extends purchase orders for the first lifecycle without receiving or inventory side effects", () => {
+    expect(purchaseOrderLifecycleMigration).toContain("alter table public.purchase_orders");
+    expect(purchaseOrderLifecycleMigration).toContain("display_number");
+    expect(purchaseOrderLifecycleMigration).toContain("'draft'");
+    expect(purchaseOrderLifecycleMigration).toContain("'sent'");
+    expect(purchaseOrderLifecycleMigration).toContain("'acknowledged'");
+    expect(purchaseOrderLifecycleMigration).toContain("'cancelled'");
+    expect(purchaseOrderLifecycleMigration).toContain("alter table public.purchase_order_lines");
+    expect(purchaseOrderLifecycleMigration).toContain("source_purchase_need_id");
+    expect(purchaseOrderLifecycleMigration).toContain("purchase_order_lines_active_source_need_uidx");
+    expect(purchaseOrderLifecycleMigration).not.toContain("create table public.goods_receipts");
+    expect(purchaseOrderLifecycleMigration).not.toContain("shopify inventory");
+    expect(purchaseOrderLifecycleMigration).not.toContain("accounting_event");
   });
 });

@@ -1,10 +1,23 @@
-import type { LoaderFunctionArgs } from "react-router";
-import { useLoaderData } from "react-router";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import {
+  Form,
+  useActionData,
+  useLoaderData,
+  useNavigation,
+} from "react-router";
 
 import { PlanningEmptyState } from "../components/PlanningEmptyState";
 import { requirePlanningContext } from "../lib/app-context.server";
 import { preparePurchaseOrderDraftPreview } from "../lib/purchase-needs.server";
-import { formatQuantity, shortReference } from "../lib/ui-format";
+import { createPurchaseOrdersFromDraftPreview } from "../lib/purchase-orders.server";
+import { formatQuantity, formatStatus, shortReference } from "../lib/ui-format";
+
+type ActionResult = {
+  ok: boolean;
+  message: string;
+  createdPurchaseOrders: Array<{ id: string; displayNumber: string }>;
+  existingPurchaseOrders: Array<{ id: string; displayNumber: string }>;
+};
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const context = await requirePlanningContext(request);
@@ -22,9 +35,60 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   };
 };
 
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const context = await requirePlanningContext(request);
+
+  if (!context.configured) {
+    return {
+      ok: false,
+      message: "Database connection is not configured.",
+      createdPurchaseOrders: [],
+      existingPurchaseOrders: [],
+    } satisfies ActionResult;
+  }
+
+  try {
+    const result = await createPurchaseOrdersFromDraftPreview(
+      context.pool,
+      context.ctx,
+    );
+
+    return {
+      ok: true,
+      message: `Created ${result.createdPurchaseOrders.length} purchase order${
+        result.createdPurchaseOrders.length === 1 ? "" : "s"
+      }. ${result.existingPurchaseOrders.length} already existed.`,
+      createdPurchaseOrders: result.createdPurchaseOrders.map((order) => ({
+        id: order.id,
+        displayNumber: order.displayNumber,
+      })),
+      existingPurchaseOrders: result.existingPurchaseOrders.map((order) => ({
+        id: order.id,
+        displayNumber: order.displayNumber,
+      })),
+    } satisfies ActionResult;
+  } catch (error) {
+    return {
+      ok: false,
+      message:
+        error instanceof Error ? formatStatus(error.message) : "Action failed.",
+      createdPurchaseOrders: [],
+      existingPurchaseOrders: [],
+    } satisfies ActionResult;
+  }
+};
+
 export default function PurchaseOrderDraftPreview() {
   const data = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
+  const navigation = useNavigation();
+  const isSubmitting = navigation.state !== "idle";
   const totalNeeds = data.groups.reduce((sum, group) => sum + group.needCount, 0);
+  const unconvertedNeeds = data.groups.reduce(
+    (sum, group) =>
+      sum + group.lines.filter((line) => !line.purchaseOrderId).length,
+    0,
+  );
 
   return (
     <s-page heading="PO Draft Preview">
@@ -46,6 +110,27 @@ export default function PurchaseOrderDraftPreview() {
               mark needs ready from the Needs board first.
             </PlanningEmptyState>
           )}
+          {actionData && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>{actionData.message}</s-paragraph>
+              {actionData.createdPurchaseOrders.map((order) => (
+                <s-paragraph key={order.id}>
+                  Created:{" "}
+                  <s-link href={`/app/purchase-orders/${order.id}`}>
+                    {order.displayNumber}
+                  </s-link>
+                </s-paragraph>
+              ))}
+              {actionData.existingPurchaseOrders.map((order) => (
+                <s-paragraph key={order.id}>
+                  Existing:{" "}
+                  <s-link href={`/app/purchase-orders/${order.id}`}>
+                    {order.displayNumber}
+                  </s-link>
+                </s-paragraph>
+              ))}
+            </s-box>
+          )}
           {data.configured && data.groups.length > 0 && (
             <s-box padding="base" borderWidth="base" borderRadius="base">
               <s-paragraph>
@@ -53,6 +138,22 @@ export default function PurchaseOrderDraftPreview() {
                 across {data.groups.length} supplier group
                 {data.groups.length === 1 ? "" : "s"}.
               </s-paragraph>
+              <Form method="post">
+                <s-button
+                  type="submit"
+                  variant="primary"
+                  disabled={unconvertedNeeds === 0}
+                  {...(isSubmitting ? { loading: true } : {})}
+                >
+                  Create Purchase Orders
+                </s-button>
+              </Form>
+              {unconvertedNeeds === 0 && (
+                <s-paragraph>
+                  All ready needs in this preview are already linked to purchase
+                  orders.
+                </s-paragraph>
+              )}
             </s-box>
           )}
           {data.groups.map((group) => (
@@ -95,6 +196,17 @@ export default function PurchaseOrderDraftPreview() {
                         </s-link>
                       ) : (
                         "Not linked"
+                      )}
+                    </s-paragraph>
+                    <s-paragraph>
+                      Purchase order:{" "}
+                      {line.purchaseOrderId ? (
+                        <s-link href={`/app/purchase-orders/${line.purchaseOrderId}`}>
+                          {line.purchaseOrderDisplayNumber ??
+                            shortReference(line.purchaseOrderId)}
+                        </s-link>
+                      ) : (
+                        "Not created yet"
                       )}
                     </s-paragraph>
                   </s-box>

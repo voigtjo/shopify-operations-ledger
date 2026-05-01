@@ -44,6 +44,9 @@ export interface PurchaseNeedBoardRow {
   assignedSupplierId: string | null;
   assignedSupplierName: string | null;
   assignedSupplierEmail: string | null;
+  purchaseOrderId: string | null;
+  purchaseOrderDisplayNumber: string | null;
+  purchaseOrderStatus: string | null;
   readyForPoDraftAt: string | null;
   createdAt: string;
 }
@@ -74,6 +77,9 @@ export interface PurchaseOrderDraftPreviewGroup {
     quantityCovered: number;
     quantityToOrder: number;
     sourceMrpRunId: string | null;
+    purchaseOrderId: string | null;
+    purchaseOrderDisplayNumber: string | null;
+    purchaseOrderStatus: string | null;
   }>;
 }
 
@@ -510,6 +516,9 @@ export async function listPurchaseNeedsBoard(
     assigned_supplier_id: string | null;
     assigned_supplier_name: string | null;
     assigned_supplier_email: string | null;
+    purchase_order_id: string | null;
+    purchase_order_display_number: string | null;
+    purchase_order_status: string | null;
     ready_for_po_draft_at: Date | null;
     created_at: Date;
   }>(
@@ -528,6 +537,9 @@ export async function listPurchaseNeedsBoard(
              assigned_suppliers.id as assigned_supplier_id,
              assigned_suppliers.name as assigned_supplier_name,
              assigned_suppliers.email as assigned_supplier_email,
+             purchase_orders.id as purchase_order_id,
+             coalesce(purchase_orders.display_number, purchase_orders.po_number) as purchase_order_display_number,
+             purchase_orders.status as purchase_order_status,
              purchase_needs.ready_for_po_draft_at,
              purchase_needs.created_at
       from public.purchase_needs
@@ -543,6 +555,15 @@ export async function listPurchaseNeedsBoard(
        and recommended_suppliers.active = true
       left join public.suppliers as assigned_suppliers
         on assigned_suppliers.id = purchase_needs.assigned_supplier_id
+      left join public.purchase_order_lines
+        on purchase_order_lines.tenant_id = purchase_needs.tenant_id
+       and (
+         purchase_order_lines.source_purchase_need_id = purchase_needs.id
+         or purchase_order_lines.purchase_need_id = purchase_needs.id
+       )
+       and lower(purchase_order_lines.status) <> 'cancelled'
+      left join public.purchase_orders
+        on purchase_orders.id = purchase_order_lines.purchase_order_id
       where purchase_needs.tenant_id = $1
       ${filterWhereClause(filter)}
       order by purchase_needs.created_at desc
@@ -598,6 +619,9 @@ export async function listPurchaseNeedsBoard(
       assignedSupplierId: need.assigned_supplier_id,
       assignedSupplierName: need.assigned_supplier_name,
       assignedSupplierEmail: need.assigned_supplier_email,
+      purchaseOrderId: need.purchase_order_id,
+      purchaseOrderDisplayNumber: need.purchase_order_display_number,
+      purchaseOrderStatus: need.purchase_order_status,
       readyForPoDraftAt: need.ready_for_po_draft_at?.toISOString() ?? null,
       createdAt: need.created_at.toISOString(),
     })) satisfies PurchaseNeedBoardRow[],
@@ -906,6 +930,9 @@ export async function preparePurchaseOrderDraftPreview(
     supplier_name: string;
     supplier_email: string | null;
     mrp_run_id: string | null;
+    purchase_order_id: string | null;
+    purchase_order_display_number: string | null;
+    purchase_order_status: string | null;
   }>(
     `
       select purchase_needs.id,
@@ -917,13 +944,25 @@ export async function preparePurchaseOrderDraftPreview(
              purchase_needs.assigned_supplier_id,
              suppliers.name as supplier_name,
              suppliers.email as supplier_email,
-             mrp_run_lines.mrp_run_id
+             mrp_run_lines.mrp_run_id,
+             purchase_orders.id as purchase_order_id,
+             coalesce(purchase_orders.display_number, purchase_orders.po_number) as purchase_order_display_number,
+             purchase_orders.status as purchase_order_status
       from public.purchase_needs
       join public.suppliers
         on suppliers.id = purchase_needs.assigned_supplier_id
        and suppliers.active = true
       left join public.mrp_run_lines
         on mrp_run_lines.id = purchase_needs.mrp_run_line_id
+      left join public.purchase_order_lines
+        on purchase_order_lines.tenant_id = purchase_needs.tenant_id
+       and (
+         purchase_order_lines.source_purchase_need_id = purchase_needs.id
+         or purchase_order_lines.purchase_need_id = purchase_needs.id
+       )
+       and lower(purchase_order_lines.status) <> 'cancelled'
+      left join public.purchase_orders
+        on purchase_orders.id = purchase_order_lines.purchase_order_id
       where purchase_needs.tenant_id = $1
         and purchase_needs.ready_for_po_draft_at is not null
         and ${activePurchaseNeedStatusSql()}
@@ -963,6 +1002,9 @@ export async function preparePurchaseOrderDraftPreview(
       quantityCovered,
       quantityToOrder,
       sourceMrpRunId: row.mrp_run_id,
+      purchaseOrderId: row.purchase_order_id,
+      purchaseOrderDisplayNumber: row.purchase_order_display_number,
+      purchaseOrderStatus: row.purchase_order_status,
     });
   }
 
