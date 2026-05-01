@@ -1,6 +1,7 @@
 import type { LoaderFunctionArgs } from "react-router";
 import { Form, useLoaderData } from "react-router";
 
+import { PageIntro, StatusBadge, SummaryCard } from "../components/OperationsUi";
 import { PlanningEmptyState } from "../components/PlanningEmptyState";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
@@ -59,10 +60,11 @@ export default function ItemsIndex() {
     <s-page heading="Items & Materials">
       <s-section heading="Item catalog">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
+          <PageIntro>
             Shopify variants remain the product source of record. Operations
-            Ledger adds operational classification for planning.
-          </s-paragraph>
+            Ledger adds operational classification for BOM, MRP, purchasing,
+            and production planning.
+          </PageIntro>
           <Form method="get">
             <s-stack direction="inline" gap="small">
               <label>
@@ -99,37 +101,26 @@ export default function ItemsIndex() {
             </PlanningEmptyState>
           )}
           {data.items.map((item) => (
-            <s-box
+            <SummaryCard
               key={item.id}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
+              heading={item.sku ?? "No SKU"}
             >
-              <s-stack direction="block" gap="small">
-                <s-paragraph>
-                  <s-link href={`/app/items/${item.id}`}>
-                    {item.sku ?? "No SKU"}
-                  </s-link>
-                  <s-text> · {formatStatus(item.itemType)}</s-text>
-                  <s-text> · available {formatQuantity(item.availableQuantity)}</s-text>
-                </s-paragraph>
-                <s-paragraph>
-                  <s-text>{shortReference(item.shopifyVariantId)}</s-text>
-                  <s-text>
-                    {" "}
-                    · {item.isSellable ? "Sellable" : "Not sellable"}
-                  </s-text>
-                  <s-text>
-                    {" "}
-                    · {item.isPurchasable ? "Purchasable" : "Not purchasable"}
-                  </s-text>
-                  <s-text>
-                    {" "}
-                    · {item.isProducible ? "Producible" : "Not producible"}
-                  </s-text>
-                </s-paragraph>
-              </s-stack>
-            </s-box>
+              <s-paragraph>
+                <StatusBadge status={item.itemType} /> Available{" "}
+                {formatQuantity(item.availableQuantity)}
+              </s-paragraph>
+              <s-paragraph>
+                Shopify variant: {shortReference(item.shopifyVariantId)}
+              </s-paragraph>
+              <s-paragraph>
+                {item.isSellable ? "Sellable" : "Not sellable"} -{" "}
+                {item.isPurchasable ? "Purchasable" : "Not purchasable"} -{" "}
+                {item.isProducible ? "Producible" : "Not producible"}
+              </s-paragraph>
+              <s-link href={`/app/items/${item.id}`}>
+                Review classification
+              </s-link>
+            </SummaryCard>
           ))}
         </s-stack>
       </s-section>

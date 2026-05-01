@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
 
+import { PageIntro, StatusBadge, SummaryCard } from "../components/OperationsUi";
 import { PlanningEmptyState } from "../components/PlanningEmptyState";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
@@ -8,7 +9,7 @@ import {
   loadMrpRunList,
   runDemoKitMrpPreview,
 } from "../lib/material-planning.server";
-import { formatStatus, shortReference } from "../lib/ui-format";
+import { shortReference } from "../lib/ui-format";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const context = await requirePlanningContext(request);
@@ -51,9 +52,10 @@ export default function MrpIndex() {
     <s-page heading="MRP Runs">
       <s-section heading="Planning previews">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
+          <PageIntro>
             MRP runs are previews until you explicitly commit recommended needs.
-          </s-paragraph>
+            They do not create procurement or production work until commit.
+          </PageIntro>
           {actionData && (
             <s-box padding="base" borderWidth="base" borderRadius="base">
               <s-paragraph>{actionData.message}</s-paragraph>
@@ -78,27 +80,21 @@ export default function MrpIndex() {
             <PlanningEmptyState>No MRP runs yet.</PlanningEmptyState>
           )}
           {data.runs.map((run) => (
-            <s-box
+            <SummaryCard
               key={run.id}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
+              heading={run.runNumber || shortReference(run.id)}
             >
               <s-paragraph>
-                <s-link href={`/app/mrp/${run.id}`}>
-                  {run.runNumber || shortReference(run.id)}
-                </s-link>
-                <s-text> · {formatStatus(run.status)}</s-text>
-                <s-text> · {run.lineCount} lines</s-text>
+                <StatusBadge status={run.status} /> {run.lineCount} line
+                {run.lineCount === 1 ? "" : "s"}
               </s-paragraph>
               <s-paragraph>
-                <s-text>
-                  {run.needsCommitted
-                    ? `${run.committedCount} lines committed`
-                    : "Needs not committed"}
-                </s-text>
+                {run.needsCommitted
+                  ? `${run.committedCount} lines committed to needs`
+                  : "Preview only - needs not committed"}
               </s-paragraph>
-            </s-box>
+              <s-link href={`/app/mrp/${run.id}`}>Open MRP run</s-link>
+            </SummaryCard>
           ))}
         </s-stack>
       </s-section>

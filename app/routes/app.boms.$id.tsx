@@ -7,6 +7,7 @@ import {
   useNavigation,
 } from "react-router";
 
+import { NextActionCard, StatusBadge, SummaryCard } from "../components/OperationsUi";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
   createOrUpdateBom,
@@ -106,6 +107,21 @@ export default function BomDetail() {
 
   return (
     <s-page heading={`BOM · ${bom.parentSku ?? bom.parentItemId}`}>
+      <s-section heading="BOM summary">
+        <SummaryCard heading={bom.parentSku ?? bom.parentItemId}>
+          <s-paragraph>
+            Version {bom.version}{" "}
+            <StatusBadge status={bom.isActive ? "active" : "inactive"} />{" "}
+            <StatusBadge status={bom.validation.valid ? "valid" : "needs_attention"} />
+          </s-paragraph>
+          <s-paragraph>
+            Parent type: {formatStatus(bom.parentItemType)} - producible:{" "}
+            {bom.parentIsProducible ? "Yes" : "No"}
+          </s-paragraph>
+          <s-link href="/app/boms">Back to BOMs</s-link>
+        </SummaryCard>
+      </s-section>
+
       <s-section heading="BOM detail">
         <s-stack direction="block" gap="base">
           {actionData && "message" in actionData && (
@@ -113,20 +129,25 @@ export default function BomDetail() {
               <s-paragraph>{actionData.message}</s-paragraph>
             </s-box>
           )}
-          <s-paragraph>
-            Parent item: {bom.parentSku ?? bom.parentItemId} ·{" "}
-            {formatStatus(bom.parentItemType)}
-          </s-paragraph>
-          <s-paragraph>
-            Parent can be active BOM parent:{" "}
-            {bom.parentIsProducible ? "Yes" : "No"}
-          </s-paragraph>
-          <s-paragraph>
-            Validation:{" "}
-            {bom.validation.valid
-              ? "Valid"
-              : bom.validation.errors.map(formatStatus).join(", ")}
-          </s-paragraph>
+          {!bom.parentIsProducible && (
+            <NextActionCard
+              title="Parent item is not producible"
+              href={`/app/items/${bom.parentItemId}`}
+              actionLabel="Open parent item"
+            >
+              Active BOM parents must be producible before MRP can use this BOM
+              cleanly.
+            </NextActionCard>
+          )}
+          {!bom.validation.valid && (
+            <NextActionCard
+              title="BOM validation needs attention"
+              href={`/app/boms/${bom.id}`}
+              actionLabel="Review component lines"
+            >
+              {bom.validation.errors.map(formatStatus).join(", ")}
+            </NextActionCard>
+          )}
           <Form method="post">
             <s-stack direction="block" gap="base">
               <label>
@@ -223,6 +244,12 @@ export default function BomDetail() {
               Run MRP Preview for This BOM
             </s-button>
           </Form>
+          {bom.validation.valid && (
+            <s-paragraph>
+              Next: run an MRP Preview to see material shortages for one unit of
+              this parent item.
+            </s-paragraph>
+          )}
         </s-stack>
       </s-section>
     </s-page>

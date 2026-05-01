@@ -6,6 +6,7 @@ import {
   useNavigation,
 } from "react-router";
 
+import { PageIntro, StatusBadge, SummaryCard } from "../components/OperationsUi";
 import { PlanningEmptyState } from "../components/PlanningEmptyState";
 import { requirePlanningContext } from "../lib/app-context.server";
 import { preparePurchaseOrderDraftPreview } from "../lib/purchase-needs.server";
@@ -94,11 +95,11 @@ export default function PurchaseOrderDraftPreview() {
     <s-page heading="PO Draft Preview">
       <s-section heading="Prepare PO Draft">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
+          <PageIntro>
             This preview groups ready purchase needs by supplier and shows what
-            would become purchase order lines. Final PO creation, approval,
-            sending, and receiving are later scope.
-          </s-paragraph>
+            will become purchase order lines. Receiving, supplier email, and
+            inventory updates are later scope.
+          </PageIntro>
           {!data.configured && (
             <PlanningEmptyState>
               Database connection is not configured.
@@ -132,7 +133,7 @@ export default function PurchaseOrderDraftPreview() {
             </s-box>
           )}
           {data.configured && data.groups.length > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
+            <SummaryCard heading="Draft readiness">
               <s-paragraph>
                 {totalNeeds} purchase need{totalNeeds === 1 ? "" : "s"} ready
                 across {data.groups.length} supplier group
@@ -154,17 +155,14 @@ export default function PurchaseOrderDraftPreview() {
                   orders.
                 </s-paragraph>
               )}
-            </s-box>
+            </SummaryCard>
           )}
           {data.groups.map((group) => (
-            <s-box
+            <SummaryCard
               key={group.supplierId}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
+              heading={group.supplierName}
             >
               <s-stack direction="block" gap="small">
-                <s-heading>{group.supplierName}</s-heading>
                 <s-paragraph>
                   {group.supplierEmail ?? "No supplier email"} -{" "}
                   {group.needCount} need{group.needCount === 1 ? "" : "s"} -
@@ -206,13 +204,13 @@ export default function PurchaseOrderDraftPreview() {
                             shortReference(line.purchaseOrderId)}
                         </s-link>
                       ) : (
-                        "Not created yet"
+                        <StatusBadge status="not_created" />
                       )}
                     </s-paragraph>
                   </s-box>
                 ))}
               </s-stack>
-            </s-box>
+            </SummaryCard>
           ))}
           <s-link href="/app/needs">Back to Needs board</s-link>
         </s-stack>

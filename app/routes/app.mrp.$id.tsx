@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
 
+import { NextActionCard, StatusBadge, SummaryCard } from "../components/OperationsUi";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
   commitMrpRunNeeds,
@@ -79,16 +80,42 @@ export default function MrpDetail() {
               <s-paragraph>{actionData.message}</s-paragraph>
             </s-box>
           )}
-          <s-paragraph>Status: {formatStatus(run.status)}</s-paragraph>
-          <s-paragraph>
-            Source: {formatStatus(run.demandSourceType)} ·{" "}
-            {shortReference(run.demandSourceId)}
-          </s-paragraph>
-          <s-paragraph>
-            {committedCount > 0
-              ? `${committedCount} line(s) already committed`
-              : "No needs committed yet"}
-          </s-paragraph>
+          <SummaryCard heading="MRP Preview Status">
+            <s-paragraph>
+              <StatusBadge status={run.status} />{" "}
+              <StatusBadge
+                status={committedCount > 0 ? "needs_committed" : "preview_only"}
+              />
+            </s-paragraph>
+            <s-paragraph>
+              Source: {formatStatus(run.demandSourceType)} -{" "}
+              {shortReference(run.demandSourceId)}
+            </s-paragraph>
+            <s-paragraph>
+              {committedCount > 0
+                ? `${committedCount} line(s) already committed`
+                : "No purchase or production needs have been created from this preview."}
+            </s-paragraph>
+            <s-link href="/app/mrp">Back to MRP runs</s-link>
+          </SummaryCard>
+          {canCommit ? (
+            <NextActionCard
+              title="Commit operational needs"
+              href="/app/needs"
+              actionLabel="Open Needs after commit"
+            >
+              Commit this preview to create purchase and production needs from
+              shortage lines. Preview lines with no shortage stay informational.
+            </NextActionCard>
+          ) : (
+            <NextActionCard
+              title="Review committed work"
+              href="/app/needs"
+              actionLabel="Open Needs"
+            >
+              This run has no remaining shortage lines available to commit.
+            </NextActionCard>
+          )}
           <Form method="post">
             <s-button
               type="submit"
@@ -115,15 +142,15 @@ export default function MrpDetail() {
                 <s-link href={`/app/items/${line.itemId}`}>
                   {line.sku ?? line.itemId}
                 </s-link>
-                <s-text> · {formatAction(line.recommendedAction)}</s-text>
+                <s-text> - {formatAction(line.recommendedAction)}</s-text>
                 <s-text>
                   {" "}
-                  · {line.committed ? "Already committed" : "Not committed"}
+                  - {line.committed ? "Already committed" : "Not committed"}
                 </s-text>
               </s-paragraph>
               <s-paragraph>
-                Required {formatQuantity(line.requiredQuantity)} · Available{" "}
-                {formatQuantity(line.availableQuantity)} · Shortage{" "}
+                Required {formatQuantity(line.requiredQuantity)} - Available{" "}
+                {formatQuantity(line.availableQuantity)} - Shortage{" "}
                 {formatQuantity(line.shortageQuantity)}
               </s-paragraph>
               <s-paragraph>{line.explanation}</s-paragraph>

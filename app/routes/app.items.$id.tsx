@@ -7,6 +7,11 @@ import {
   useNavigation,
 } from "react-router";
 
+import {
+  NextActionCard,
+  StatusBadge,
+  SummaryCard,
+} from "../components/OperationsUi";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
   loadItemDetail,
@@ -87,6 +92,19 @@ export default function ItemDetail() {
 
   return (
     <s-page heading={item.sku ?? "Item detail"}>
+      <s-section heading="Item summary">
+        <SummaryCard heading={item.sku ?? "Item"}>
+          <s-paragraph>
+            <StatusBadge status={item.itemType} /> Unit {item.unit} - available{" "}
+            {formatQuantity(item.availableQuantity)}
+          </s-paragraph>
+          <s-paragraph>
+            Shopify variant: {shortReference(item.shopifyVariantId)}
+          </s-paragraph>
+          <s-link href="/app/items">Back to Items</s-link>
+        </SummaryCard>
+      </s-section>
+
       <s-section heading="Classification">
         <s-stack direction="block" gap="base">
           {actionData && "message" in actionData && (
@@ -94,12 +112,6 @@ export default function ItemDetail() {
               <s-paragraph>{actionData.message}</s-paragraph>
             </s-box>
           )}
-          <s-paragraph>
-            Shopify variant: {shortReference(item.shopifyVariantId)}
-          </s-paragraph>
-          <s-paragraph>
-            Available quantity: {formatQuantity(item.availableQuantity)}
-          </s-paragraph>
           <Form method="post">
             <s-stack direction="block" gap="base">
               <label>
@@ -153,11 +165,23 @@ export default function ItemDetail() {
 
       <s-section heading="Planning usage">
         <s-stack direction="block" gap="base">
+          {!item.canBeBomParent && (
+            <NextActionCard
+              title="BOM parent not ready"
+              href={`/app/items/${item.id}`}
+              actionLabel="Update classification"
+            >
+              Mark the item as producible before using it as an active BOM
+              parent.
+            </NextActionCard>
+          )}
           <s-paragraph>
-            BOM parent: {item.canBeBomParent ? "Allowed" : "Requires producible item"}
+            BOM parent:{" "}
+            {item.canBeBomParent ? "Allowed" : "Requires producible item"}
           </s-paragraph>
           <s-paragraph>
-            BOM component: {item.canBeComponent ? "Allowed" : "Review classification first"}
+            BOM component:{" "}
+            {item.canBeComponent ? "Allowed" : "Review classification first"}
           </s-paragraph>
           {item.relatedBom ? (
             <s-paragraph>
@@ -179,17 +203,17 @@ export default function ItemDetail() {
             {item.mrpLines.map((line) => (
               <s-paragraph key={line.id}>
                 <s-link href={`/app/mrp/${line.mrpRunId}`}>
-                  {shortReference(line.mrpRunId)}
-                </s-link>
+                {shortReference(line.mrpRunId)}
+              </s-link>
                 <s-text>
                   {" "}
-                  · required {formatQuantity(line.requiredQuantity)}
+                  - required {formatQuantity(line.requiredQuantity)}
                 </s-text>
                 <s-text>
                   {" "}
-                  · shortage {formatQuantity(line.shortageQuantity)}
+                  - shortage {formatQuantity(line.shortageQuantity)}
                 </s-text>
-                <s-text> · {formatAction(line.recommendedAction)}</s-text>
+                <s-text> - {formatAction(line.recommendedAction)}</s-text>
               </s-paragraph>
             ))}
           </s-stack>

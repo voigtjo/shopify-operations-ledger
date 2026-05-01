@@ -6,6 +6,7 @@ import {
   useNavigation,
 } from "react-router";
 
+import { PageIntro, StatusBadge, SummaryCard } from "../components/OperationsUi";
 import { PlanningEmptyState } from "../components/PlanningEmptyState";
 import { requirePlanningContext } from "../lib/app-context.server";
 import { loadItemList } from "../lib/material-planning.server";
@@ -228,10 +229,10 @@ export default function SuppliersIndex() {
     <s-page heading="Suppliers">
       <s-section heading="Supplier Management">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
+          <PageIntro>
             Maintain suppliers and preferred item sourcing before preparing PO
-            drafts. Final purchase order creation is later scope.
-          </s-paragraph>
+            drafts. Supplier email and external integrations are later scope.
+          </PageIntro>
           {!data.configured && (
             <PlanningEmptyState>
               Database connection is not configured.
@@ -272,31 +273,19 @@ export default function SuppliersIndex() {
             </PlanningEmptyState>
           )}
           {data.suppliers.map((supplier) => (
-            <s-box
+            <SummaryCard
               key={supplier.id}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
+              heading={supplier.name}
             >
               <s-stack direction="block" gap="small">
                 <s-paragraph>
-                  <s-text>{supplier.name}</s-text>
-                  <s-text>
-                    {" "}
-                    - {supplier.active ? "Active" : "Inactive"}
-                  </s-text>
-                  <s-text>
-                    {" "}
-                    - {supplier.linkedItemCount ?? 0} linked item
-                    {(supplier.linkedItemCount ?? 0) === 1 ? "" : "s"}
-                  </s-text>
-                  <s-text>
-                    {" "}
-                    - {supplier.openPurchaseNeedCount ?? 0} open assigned need
-                    {(supplier.openPurchaseNeedCount ?? 0) === 1 ? "" : "s"}
-                  </s-text>
+                  <StatusBadge status={supplier.active ? "active" : "inactive"} />{" "}
+                  {supplier.linkedItemCount ?? 0} linked item
+                  {(supplier.linkedItemCount ?? 0) === 1 ? "" : "s"} -{" "}
+                  {supplier.openPurchaseNeedCount ?? 0} open assigned need
+                  {(supplier.openPurchaseNeedCount ?? 0) === 1 ? "" : "s"}
                 </s-paragraph>
-                <s-paragraph>{supplier.email ?? "No email"}</s-paragraph>
+                <s-paragraph>Email: {supplier.email ?? "No email"}</s-paragraph>
                 <Form method="post">
                   <input
                     type="hidden"
@@ -350,7 +339,7 @@ export default function SuppliersIndex() {
                   </s-button>
                 </Form>
               </s-stack>
-            </s-box>
+            </SummaryCard>
           ))}
         </s-stack>
       </s-section>
@@ -409,21 +398,14 @@ export default function SuppliersIndex() {
             </PlanningEmptyState>
           )}
           {data.supplierItemLinks.map((link) => (
-            <s-box
+            <SummaryCard
               key={link.id}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
+              heading={`${link.supplierName} - ${link.itemSku ?? link.itemId}`}
             >
               <s-stack direction="block" gap="small">
                 <s-paragraph>
-                  <s-text>{link.supplierName}</s-text>
-                  <s-text> - {link.itemSku ?? link.itemId}</s-text>
-                  <s-text>
-                    {" "}
-                    - {link.isPreferred ? "Preferred" : "Backup"}
-                  </s-text>
-                  <s-text> - {link.active ? "Active" : "Inactive"}</s-text>
+                  <StatusBadge status={link.isPreferred ? "preferred" : "backup"} />{" "}
+                  <StatusBadge status={link.active ? "active" : "inactive"} />
                 </s-paragraph>
                 <s-paragraph>
                   Supplier SKU: {link.supplierSku ?? "Not set"} - unit{" "}
@@ -473,7 +455,7 @@ export default function SuppliersIndex() {
                   </Form>
                 </s-stack>
               </s-stack>
-            </s-box>
+            </SummaryCard>
           ))}
         </s-stack>
       </s-section>

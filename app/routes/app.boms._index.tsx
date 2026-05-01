@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
 
+import { PageIntro, StatusBadge, SummaryCard } from "../components/OperationsUi";
 import { PlanningEmptyState } from "../components/PlanningEmptyState";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
@@ -51,10 +52,10 @@ export default function BomsIndex() {
     <s-page heading="BOMs">
       <s-section heading="Bills of material">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
+          <PageIntro>
             BOMs explain which components are required when MRP plans a
             producible item.
-          </s-paragraph>
+          </PageIntro>
           {actionData && (
             <s-box padding="base" borderWidth="base" borderRadius="base">
               <s-paragraph>{actionData.message}</s-paragraph>
@@ -79,30 +80,27 @@ export default function BomsIndex() {
             <PlanningEmptyState>No BOMs have been created yet.</PlanningEmptyState>
           )}
           {data.boms.map((bom) => (
-            <s-box
+            <SummaryCard
               key={bom.id}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
+              heading={bom.parentSku ?? bom.parentVariantId}
             >
               <s-paragraph>
-                <s-link href={`/app/boms/${bom.id}`}>
-                  {bom.parentSku ?? bom.parentVariantId}
-                </s-link>
-                <s-text> · version {bom.version}</s-text>
-                <s-text> · {bom.isActive ? "Active" : "Inactive"}</s-text>
+                Version {bom.version}{" "}
+                <StatusBadge status={bom.isActive ? "active" : "inactive"} />
               </s-paragraph>
               <s-paragraph>
-                <s-text>{bom.lines.length} component lines</s-text>
-                <s-text>
-                  {" "}
-                  ·{" "}
-                  {bom.validation.valid
-                    ? "Valid"
-                    : `Invalid: ${bom.validation.errors.map(formatStatus).join(", ")}`}
-                </s-text>
+                {bom.lines.length} component line
+                {bom.lines.length === 1 ? "" : "s"} -{" "}
+                {bom.validation.valid
+                  ? "Valid for MRP"
+                  : `Needs attention: ${bom.validation.errors
+                      .map(formatStatus)
+                      .join(", ")}`}
               </s-paragraph>
-            </s-box>
+              <s-link href={`/app/boms/${bom.id}`}>
+                Open BOM editor
+              </s-link>
+            </SummaryCard>
           ))}
         </s-stack>
       </s-section>

@@ -1,6 +1,13 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
 
+import {
+  KpiCard,
+  NextActionCard,
+  PageIntro,
+  StatusBadge,
+  SummaryCard,
+} from "../components/OperationsUi";
 import { PlanningEmptyState } from "../components/PlanningEmptyState";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
@@ -176,11 +183,11 @@ export default function Dashboard() {
     <s-page heading="Operations Ledger">
       <s-section heading="Operational cockpit">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
+          <PageIntro>
             Operations Ledger turns Shopify demand into operational work:
-            classified materials, BOMs, MRP previews, and committed purchase or
-            production needs.
-          </s-paragraph>
+            classify items, define BOMs, preview material demand, commit needs,
+            assign suppliers, and create internal purchase orders.
+          </PageIntro>
           {!data.configured && (
             <s-box padding="base" borderWidth="base" borderRadius="base">
               <s-paragraph>
@@ -194,48 +201,58 @@ export default function Dashboard() {
             </s-box>
           )}
           <s-stack direction="inline" gap="base">
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{data.itemCount}</s-heading>
-              <s-paragraph>Total items</s-paragraph>
-            </s-box>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{data.activeBomCount}</s-heading>
-              <s-paragraph>Active BOMs</s-paragraph>
-            </s-box>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>
-                {data.latestMrpRun
+            <KpiCard label="Items" value={data.itemCount} href="/app/items" />
+            <KpiCard
+              label="Active BOMs"
+              value={data.activeBomCount}
+              href="/app/boms"
+            />
+            <KpiCard
+              label="Latest MRP Run"
+              value={
+                data.latestMrpRun
                   ? formatStatus(data.latestMrpRun.status)
-                  : "None"}
-              </s-heading>
-              <s-paragraph>Latest MRP run</s-paragraph>
-            </s-box>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{data.openPurchaseNeedCount}</s-heading>
-              <s-paragraph>Open purchase needs</s-paragraph>
-            </s-box>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{data.openProductionNeedCount}</s-heading>
-              <s-paragraph>Open production needs</s-paragraph>
-            </s-box>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{data.draftPurchaseOrderCount}</s-heading>
-              <s-paragraph>Draft purchase orders</s-paragraph>
-            </s-box>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{data.sentPurchaseOrderCount}</s-heading>
-              <s-paragraph>Sent purchase orders</s-paragraph>
-            </s-box>
+                  : "None"
+              }
+              href={
+                data.latestMrpRun ? `/app/mrp/${data.latestMrpRun.id}` : "/app/mrp"
+              }
+            />
+            <KpiCard
+              label="Open Purchase Needs"
+              value={data.openPurchaseNeedCount}
+              href="/app/needs"
+            />
+            <KpiCard
+              label="Needs Missing Supplier"
+              value={data.missingSupplierPurchaseNeedCount}
+              href="/app/needs?filter=open"
+            />
+            <KpiCard
+              label="Ready for PO Draft"
+              value={data.readyForPoDraftPurchaseNeedCount}
+              href="/app/needs/po-draft"
+            />
+            <KpiCard
+              label="Draft Purchase Orders"
+              value={data.draftPurchaseOrderCount}
+              href="/app/purchase-orders"
+            />
+            <KpiCard
+              label="Sent/Acknowledged Purchase Orders"
+              value={`${data.sentPurchaseOrderCount}/${data.acknowledgedPurchaseOrderCount}`}
+              href="/app/purchase-orders"
+            />
           </s-stack>
         </s-stack>
       </s-section>
 
       <s-section heading="Guided demo flow">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
+          <PageIntro>
             Use this path to test the implemented spine without leaving the
             Shopify app.
-          </s-paragraph>
+          </PageIntro>
           <s-stack direction="inline" gap="base">
             <Form method="post">
               <input
@@ -291,18 +308,24 @@ export default function Dashboard() {
               </s-button>
             </Form>
             <s-link href="/app/needs">Step 5: Review Needs</s-link>
+            <s-link href="/app/needs/po-draft">
+              Step 6: Create Purchase Orders
+            </s-link>
           </s-stack>
           {data.demoPreview ? (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
+            <SummaryCard heading="Latest Demo MRP Preview">
               <s-paragraph>
-                Latest preview {shortReference(data.demoPreview.mrpRunId)} ·{" "}
-                {formatStatus(data.demoPreview.status)}
+                {shortReference(data.demoPreview.mrpRunId)}{" "}
+                <StatusBadge status={data.demoPreview.status} />
               </s-paragraph>
               <s-paragraph>
                 Demo Kit shortage:{" "}
                 {formatQuantity(data.demoPreview.parent.shortageQuantity)}
               </s-paragraph>
-            </s-box>
+              <s-link href={`/app/mrp/${data.demoPreview.mrpRunId}`}>
+                Open latest MRP run
+              </s-link>
+            </SummaryCard>
           ) : (
             <PlanningEmptyState>
               No MRP Preview has been run for the Demo Kit yet.
@@ -314,94 +337,104 @@ export default function Dashboard() {
       <s-section heading="Next work">
         <s-stack direction="block" gap="base">
           {!data.hasDemoItems && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
+            <NextActionCard
+              title="Start item setup"
+              href="/app/items"
+              actionLabel="Open Items"
+            >
                 Missing item classifications. Start with Demo Items or import
                 Shopify variants.
-              </s-paragraph>
-            </s-box>
+            </NextActionCard>
           )}
           {data.hasDemoItems && !data.hasDemoBom && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
+            <NextActionCard
+              title="Create a BOM"
+              href="/app/boms"
+              actionLabel="Open BOMs"
+            >
                 Demo Kit exists but has no BOM. Create the BOM before running
                 MRP.
-              </s-paragraph>
-            </s-box>
-          )}
-          {data.openPurchaseNeedCount > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
-                {data.openPurchaseNeedCount} purchase need
-                {data.openPurchaseNeedCount === 1 ? "" : "s"} waiting.
-              </s-paragraph>
-              <s-link href="/app/needs">Open Purchase Needs board</s-link>
-            </s-box>
+            </NextActionCard>
           )}
           {data.missingSupplierPurchaseNeedCount > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
+            <NextActionCard
+              title="Assign suppliers"
+              href="/app/needs?filter=open"
+              actionLabel="Open missing supplier work"
+            >
                 {data.missingSupplierPurchaseNeedCount} purchase need
-                {data.missingSupplierPurchaseNeedCount === 1 ? "" : "s"} need
-                {data.missingSupplierPurchaseNeedCount === 1 ? "s" : ""} a
+                {data.missingSupplierPurchaseNeedCount === 1 ? " needs" : "s need"} a
                 supplier assignment.
-              </s-paragraph>
-              <s-link href="/app/needs?filter=open">Assign suppliers</s-link>
-            </s-box>
+            </NextActionCard>
           )}
           {data.preferredSupplierAvailablePurchaseNeedCount > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
+            <NextActionCard
+              title="Use preferred suppliers"
+              href="/app/needs?filter=open"
+              actionLabel="Assign preferred suppliers"
+            >
                 {data.preferredSupplierAvailablePurchaseNeedCount} purchase need
                 {data.preferredSupplierAvailablePurchaseNeedCount === 1
                   ? " has"
                   : "s have"}{" "}
                 a preferred supplier available.
-              </s-paragraph>
-              <s-link href="/app/needs?filter=open">
-                Assign preferred suppliers
-              </s-link>
-            </s-box>
+            </NextActionCard>
           )}
           {data.readyForPoDraftPurchaseNeedCount > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
+            <NextActionCard
+              title="Create purchase orders"
+              href="/app/needs/po-draft"
+              actionLabel="Open PO Draft Preview"
+            >
                 {data.readyForPoDraftPurchaseNeedCount} purchase need
                 {data.readyForPoDraftPurchaseNeedCount === 1 ? "" : "s"} ready
                 for PO draft preview.
-              </s-paragraph>
-              <s-link href="/app/needs/po-draft">Prepare PO Draft</s-link>
-            </s-box>
+            </NextActionCard>
           )}
           {data.draftPurchaseOrderCount > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
+            <NextActionCard
+              title="Send draft purchase orders"
+              href="/app/purchase-orders"
+              actionLabel="Open Purchase Orders"
+            >
                 {data.draftPurchaseOrderCount} draft purchase order
                 {data.draftPurchaseOrderCount === 1 ? "" : "s"} ready to send.
-              </s-paragraph>
-              <s-link href="/app/purchase-orders">Open Purchase Orders</s-link>
-            </s-box>
+            </NextActionCard>
           )}
-          {data.sentPurchaseOrderCount + data.acknowledgedPurchaseOrderCount >
-            0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
+          {data.sentPurchaseOrderCount > 0 && (
+            <NextActionCard
+              title="Track supplier acknowledgement"
+              href="/app/purchase-orders"
+              actionLabel="Review sent purchase orders"
+            >
                 {data.sentPurchaseOrderCount} sent and{" "}
                 {data.acknowledgedPurchaseOrderCount} acknowledged purchase
                 orders.
-              </s-paragraph>
-              <s-link href="/app/purchase-orders">Review Purchase Orders</s-link>
-            </s-box>
+            </NextActionCard>
           )}
           {data.openProductionNeedCount > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>
+            <NextActionCard
+              title="Production needs waiting"
+              href="/app/needs"
+              actionLabel="Open Needs"
+            >
                 {data.openProductionNeedCount} production need
                 {data.openProductionNeedCount === 1 ? "" : "s"} waiting.
-              </s-paragraph>
-              <s-link href="/app/needs">Open Needs</s-link>
-            </s-box>
+            </NextActionCard>
           )}
+          {data.configured &&
+            data.hasDemoItems &&
+            data.hasDemoBom &&
+            data.openPurchaseNeedCount === 0 &&
+            data.draftPurchaseOrderCount === 0 &&
+            data.sentPurchaseOrderCount === 0 && (
+              <SummaryCard heading="No urgent operational work">
+                <s-paragraph>
+                  Run an MRP Preview or review existing Items, BOMs, and
+                  Purchase Orders.
+                </s-paragraph>
+              </SummaryCard>
+            )}
         </s-stack>
       </s-section>
     </s-page>

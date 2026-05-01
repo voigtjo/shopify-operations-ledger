@@ -6,6 +6,11 @@ import {
   useNavigation,
 } from "react-router";
 
+import {
+  PageIntro,
+  StatusBadge,
+  WorkQueueSection,
+} from "../components/OperationsUi";
 import { PlanningEmptyState } from "../components/PlanningEmptyState";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
@@ -69,15 +74,45 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       filter,
       suppliers: [],
       purchaseNeeds: [],
+      boardCounts: {
+        missingSupplier: 0,
+        assigned: 0,
+        readyForPo: 0,
+        convertedToPo: 0,
+      },
       productionNeeds: [],
     };
   }
+
+  const board = await listPurchaseNeedsBoard(context.pool, context.ctx, {
+    filter,
+  });
+  const allBoard = await listPurchaseNeedsBoard(context.pool, context.ctx, {
+    filter: "all",
+  });
 
   return {
     configured: true as const,
     filter,
     suppliers: await listSuppliers(context.pool, context.ctx),
-    ...(await listPurchaseNeedsBoard(context.pool, context.ctx, { filter })),
+    ...board,
+    boardCounts: {
+      missingSupplier: allBoard.purchaseNeeds.filter(
+        (need) => !need.assignedSupplierId && !need.purchaseOrderId,
+      ).length,
+      assigned: allBoard.purchaseNeeds.filter(
+        (need) =>
+          need.assignedSupplierId &&
+          !need.readyForPoDraftAt &&
+          !need.purchaseOrderId,
+      ).length,
+      readyForPo: allBoard.purchaseNeeds.filter(
+        (need) => need.readyForPoDraftAt && !need.purchaseOrderId,
+      ).length,
+      convertedToPo: allBoard.purchaseNeeds.filter(
+        (need) => Boolean(need.purchaseOrderId),
+      ).length,
+    },
   };
 };
 
@@ -220,10 +255,10 @@ export default function NeedsIndex() {
     <s-page heading="Needs">
       <s-section heading="Purchase Needs Board">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
+          <PageIntro>
             Review MRP-generated purchase needs, assign a supplier, then mark
             each need ready for PO draft preparation.
-          </s-paragraph>
+          </PageIntro>
           {!data.configured && (
             <PlanningEmptyState>
               Database connection is not configured.
@@ -247,6 +282,28 @@ export default function NeedsIndex() {
             ))}
             <s-link href="/app/needs/po-draft">Prepare PO Draft</s-link>
           </s-stack>
+          {data.configured && (
+            <s-stack direction="inline" gap="base">
+              <WorkQueueSection heading="Missing Supplier">
+                <s-paragraph>{data.boardCounts.missingSupplier}</s-paragraph>
+                <s-link href="/app/needs?filter=open">Assign suppliers</s-link>
+              </WorkQueueSection>
+              <WorkQueueSection heading="Assigned">
+                <s-paragraph>{data.boardCounts.assigned}</s-paragraph>
+                <s-link href="/app/needs?filter=assigned">Review assigned</s-link>
+              </WorkQueueSection>
+              <WorkQueueSection heading="Ready for PO Draft">
+                <s-paragraph>{data.boardCounts.readyForPo}</s-paragraph>
+                <s-link href="/app/needs/po-draft">Prepare PO draft</s-link>
+              </WorkQueueSection>
+              <WorkQueueSection heading="Converted to PO">
+                <s-paragraph>{data.boardCounts.convertedToPo}</s-paragraph>
+                <s-link href="/app/purchase-orders">
+                  Open purchase orders
+                </s-link>
+              </WorkQueueSection>
+            </s-stack>
+          )}
           {data.configured && data.purchaseNeeds.length === 0 && (
             <PlanningEmptyState>
               No purchase needs match this filter.
@@ -265,7 +322,8 @@ export default function NeedsIndex() {
                 <s-stack direction="block" gap="small">
                   <s-paragraph>
                     <s-text>{need.sku ?? need.title}</s-text>
-                    <s-text> - {formatStatus(need.status)}</s-text>
+                    <s-text> </s-text>
+                    <StatusBadge status={need.status} />
                     <s-text> - {formatStatus(state)}</s-text>
                     <s-text> - qty {formatQuantity(need.quantityNeeded)}</s-text>
                   </s-paragraph>

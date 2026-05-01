@@ -6,6 +6,7 @@ import {
   useNavigation,
 } from "react-router";
 
+import { NextActionCard, StatusBadge, SummaryCard } from "../components/OperationsUi";
 import { requirePlanningContext } from "../lib/app-context.server";
 import {
   cancelPurchaseOrder,
@@ -125,6 +126,24 @@ export default function PurchaseOrderDetail() {
   }
 
   const purchaseOrder = data.purchaseOrder;
+  const nextAction =
+    purchaseOrder.status === "draft"
+      ? {
+          title: "Send purchase order",
+          message:
+            "Mark this PO as sent after you send it to the supplier outside Operations Ledger.",
+        }
+      : purchaseOrder.status === "sent"
+        ? {
+            title: "Record acknowledgement",
+            message:
+              "Mark acknowledged once the supplier confirms the order outside Operations Ledger.",
+          }
+        : {
+            title: "Procurement follow-up",
+            message:
+              "Goods Receipt comes later. This page currently tracks PO status only.",
+          };
 
   return (
     <s-page heading={purchaseOrder.displayNumber}>
@@ -135,16 +154,26 @@ export default function PurchaseOrderDetail() {
               <s-paragraph>{actionData.message}</s-paragraph>
             </s-box>
           )}
-          <s-paragraph>
-            Supplier: {purchaseOrder.supplierName}
-            {purchaseOrder.supplierEmail
-              ? ` (${purchaseOrder.supplierEmail})`
-              : ""}
-          </s-paragraph>
-          <s-paragraph>Status: {formatStatus(purchaseOrder.status)}</s-paragraph>
-          <s-paragraph>
-            Created {new Date(purchaseOrder.createdAt).toLocaleString()}
-          </s-paragraph>
+          <SummaryCard heading="Header">
+            <s-paragraph>
+              Supplier: {purchaseOrder.supplierName}
+              {purchaseOrder.supplierEmail
+                ? ` (${purchaseOrder.supplierEmail})`
+                : ""}
+            </s-paragraph>
+            <s-paragraph>
+              <StatusBadge status={purchaseOrder.status} /> Created{" "}
+              {new Date(purchaseOrder.createdAt).toLocaleString()}
+            </s-paragraph>
+            <s-link href="/app/purchase-orders">Back to Purchase Orders</s-link>
+          </SummaryCard>
+          <NextActionCard
+            title={nextAction.title}
+            href="/app/purchase-orders"
+            actionLabel="Back to Purchase Orders"
+          >
+            {nextAction.message}
+          </NextActionCard>
           <s-stack direction="inline" gap="base">
             <Form method="post">
               <input type="hidden" name="intent" value="mark-sent" />
