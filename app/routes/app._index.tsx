@@ -7,6 +7,22 @@ import {
 } from "../lib/dashboard-presentation";
 import { getFoundationDatabasePool } from "../lib/foundation-db.server";
 import {
+  createDemoKitBom,
+  createDemoKitItems,
+  loadBomList,
+  loadItemList,
+  loadLatestDemoKitMrpPreview,
+  runDemoKitMrpPreview,
+  updateItemClassification,
+  type ItemType,
+  type MrpPreviewLine,
+  type BomSummary,
+  type ItemSummary,
+  type DemoKitMrpPreview,
+  type MrpNeedCommitResult,
+  commitMrpRunNeeds,
+} from "../lib/material-planning.server";
+import {
   createDemoOperationalCases,
   loadCaseList,
   loadRecentCaseEvents,
@@ -35,7 +51,7 @@ import {
 import { authenticate } from "../shopify.server";
 
 type ActionResult =
-  | { ok: true; message: string }
+  | { ok: true; message: string; commitResult?: MrpNeedCommitResult }
   | { ok: false; message: string };
 
 type ShopifyOrderForDashboard = Awaited<
@@ -45,6 +61,13 @@ type ShopifyOrderForDashboard = Awaited<
   operationsOrderId: string | null;
   operationsOrderStatus: string | null;
 };
+
+const itemTypes: ItemType[] = [
+  "product",
+  "component",
+  "raw_material",
+  "assembly",
+];
 
 function formString(formData: FormData, key: string) {
   const value = formData.get(key);
@@ -93,6 +116,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   let shopifyOrdersError: string | null = null;
   let operationCases: Awaited<ReturnType<typeof loadCaseList>> = [];
   let recentCaseEvents: Awaited<ReturnType<typeof loadRecentCaseEvents>> = [];
+  let materialItems: ItemSummary[] = [];
+  let boms: BomSummary[] = [];
+  let demoKitMrpPreview: DemoKitMrpPreview | null = null;
 
   try {
     const recentOrders = await fetchRecentShopifyOrders(admin, 10);
@@ -137,6 +163,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
       operationCases = await loadCaseList(pool, ctx, { limit: 12 });
       recentCaseEvents = await loadRecentCaseEvents(pool, ctx, { limit: 8 });
+      materialItems = await loadItemList(pool, ctx, { limit: 50 });
+      boms = await loadBomList(pool, ctx);
+      demoKitMrpPreview = await loadLatestDemoKitMrpPreview(pool, ctx);
     }
   }
 
@@ -146,6 +175,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     shopifyOrdersError,
     operationCases,
     recentCaseEvents,
+    materialItems,
+    boms,
+    demoKitMrpPreview,
   };
 };
 
@@ -208,6 +240,125 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return {
       ok: true,
       message: `Demo operational cases are ready (${result.operationCaseIds.length}).`,
+    } satisfies ActionResult;
+  }
+
+  if (intent === "create-demo-kit-items") {
+    const result = await createDemoKitItems(pool, ctx);
+
+    return {
+      ok: true,
+      message: `Demo kit item setup is ready (${result.count} items).`,
+    } satisfies ActionResult;
+  }
+
+  if (intent === "create-demo-kit-bom") {
+    await createDemoKitBom(pool, ctx);
+
+    return {
+      ok: true,
+      message:
+        "Demo Kit BOM is ready: 1 x BOX, 2 x COMPONENT-A, 1 x MANUAL.",
+    } satisfies ActionResult;
+  }
+
+  if (intent === "update-item-settings") {
+    const itemId = formString(formData, "itemId");
+    const itemType = formString(formData, "itemType");
+    const unit = formString(formData, "unit") ?? "pcs";
+
+    if (!itemId || !itemType || !itemTypes.includes(itemType as ItemType)) {
+      return {
+        ok: false,
+        message: "Select a valid item and item type before saving.",
+      } satisfies ActionResult;
+    }
+
+    await updateItemClassification(pool, ctx, {
+      itemId,
+      itemType: itemType as ItemType,
+      unit,
+      isSellable: formData.get("isSellable") === "on",
+      isPurchasable: formData.get("isPurchasable") === "on",
+      isProducible: formData.get("isProducible") === "on",
+    });
+
+    return {
+      ok: true,
+      message: "Item classification updated.",
+    } satisfies ActionResult;
+  }
+
+  if (intent === "run-mrp-preview") {
+    const preview = await runDemoKitMrpPreview(pool, ctx, 1);
+
+    return {
+      ok: Boolean(preview),
+      message: preview
+        ? "MRP preview saved for 1 Demo Kit. No purchase or production needs were created."
+        : "Create Demo Kit Items and Demo Kit BOM before previewing MRP.",
+    } satisfies ActionResult;
+  }
+
+  if (intent === "commit-mrp-needs") {
+    const mrpRunId = formString(formData, "mrpRunId");
+
+    if (!mrpRunId) {
+      return {
+        ok: false,
+        message: "Run an MRP Preview before committing needs.",
+      } satisfies ActionResult;
+    }
+
+    const commitResult = await commitMrpRunNeeds(pool, ctx, { mrpRunId });
+    const createdPurchaseNeeds = commitResult.purchaseNeeds.filter(
+      (need) => !need.alreadyCommitted,
+    ).length;
+    const createdProductionNeeds = commitResult.productionNeeds.filter(
+      (need) => !need.alreadyCommitted,
+    ).length;
+    const alreadyCommitted =
+      commitResult.purchaseNeeds.filter((need) => need.alreadyCommitted)
+        .length +
+      commitResult.productionNeeds.filter((need) => need.alreadyCommitted)
+        .length;
+
+    return {
+      ok: true,
+      message: `Committed MRP needs. Created ${createdPurchaseNeeds} purchase need(s), ${createdProductionNeeds} production need(s). ${alreadyCommitted} need(s) were already committed.`,
+      commitResult,
+    } satisfies ActionResult;
+  }
+
+  if (intent === "run-demo-kit-supply-check") {
+    await createDemoKitBom(pool, ctx);
+
+    const demoKitOrder = {
+      shopDomain: session.shop,
+      shopifyOrderId: `demo-mrp-kit-order:${session.shop.toLowerCase()}`,
+      shopifyOrderName: "DEV-MRP-1001",
+      customerName: "Development Customer",
+      customerExternalId: "demo-customer",
+      currency: "EUR",
+      rawPayload: {
+        source: "operations-ledger-mrp-dev-action",
+        shopDomain: session.shop,
+      },
+      lines: [
+        {
+          shopifyVariantId: "demo-variant:demo-kit",
+          sku: "DEMO-KIT",
+          title: "Demo Kit",
+          quantity: 1,
+        },
+      ],
+    };
+    const imported = await importShopifyOrder(pool, demoKitOrder);
+    const result = await runSupplyCheck(pool, ctx, imported.operationsOrderId);
+
+    return {
+      ok: true,
+      message: `Demo Kit Supply Check completed: ${result.status}. Production needs: ${result.createdProductionNeeds.length}; purchase needs: ${result.createdPurchaseNeeds.length}.`,
     } satisfies ActionResult;
   }
 
@@ -347,6 +498,21 @@ function formatCaseType(caseType: string) {
     .join(" ");
 }
 
+function shortReference(value: string | null) {
+  if (!value) {
+    return "Not linked";
+  }
+
+  return value.length > 32 ? `...${value.slice(-18)}` : value;
+}
+
+function formatAction(action: MrpPreviewLine["action"]) {
+  return action
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 function EmptyState({ children }: { children: string }) {
   return <s-paragraph>{children}</s-paragraph>;
 }
@@ -377,6 +543,15 @@ export default function Index() {
     (sum, operationCase) => sum + operationCase.openTaskCount,
     0,
   );
+  const hasDemoKitItems = data.materialItems.some(
+    (item) => item.sku === "DEMO-KIT",
+  );
+  const hasDemoKitBom = data.boms.some((bom) => bom.parentSku === "DEMO-KIT");
+  const materialsNextAction = !hasDemoKitItems
+    ? "Configure item classification by creating the demo kit items."
+    : !hasDemoKitBom
+      ? "Create the Demo Kit BOM so MRP can explode component demand."
+      : "Run MRP preview to see shortages and recommended buy/make actions before committing any needs.";
   const activeFlowStage = dashboardFlowStages.findIndex((stage) =>
     nextAction.stage === "ORDER"
       ? stage === "Order"
@@ -426,6 +601,57 @@ export default function Index() {
               background="subdued"
             >
               <s-paragraph>{actionData.message}</s-paragraph>
+              {actionData.ok && actionData.commitResult && (
+                <s-stack direction="block" gap="small">
+                  <s-paragraph>
+                    Purchase needs:{" "}
+                    {actionData.commitResult.purchaseNeeds.length}
+                  </s-paragraph>
+                  {actionData.commitResult.purchaseNeeds.map((need) => (
+                    <s-paragraph key={`purchase-${need.id}`}>
+                      <s-text>{need.sku ?? need.id}</s-text>
+                      <s-text> · qty {formatQuantity(need.quantity)}</s-text>
+                      <s-text> · {need.status}</s-text>
+                      <s-text>
+                        {" "}
+                        ·{" "}
+                        {need.alreadyCommitted
+                          ? "Already committed"
+                          : "Created"}
+                      </s-text>
+                    </s-paragraph>
+                  ))}
+                  <s-paragraph>
+                    Production needs:{" "}
+                    {actionData.commitResult.productionNeeds.length}
+                  </s-paragraph>
+                  {actionData.commitResult.productionNeeds.map((need) => (
+                    <s-paragraph key={`production-${need.id}`}>
+                      <s-text>{need.sku ?? need.id}</s-text>
+                      <s-text> · qty {formatQuantity(need.quantity)}</s-text>
+                      <s-text> · {need.status}</s-text>
+                      <s-text>
+                        {" "}
+                        ·{" "}
+                        {need.alreadyCommitted
+                          ? "Already committed"
+                          : "Created"}
+                      </s-text>
+                    </s-paragraph>
+                  ))}
+                  {actionData.commitResult.skippedLines.length > 0 && (
+                    <s-paragraph>
+                      Skipped lines:{" "}
+                      {actionData.commitResult.skippedLines
+                        .map(
+                          (line) =>
+                            `${line.sku ?? line.mrpRunLineId} (${line.reason})`,
+                        )
+                        .join(", ")}
+                    </s-paragraph>
+                  )}
+                </s-stack>
+              )}
             </s-box>
           )}
         </s-stack>
@@ -435,6 +661,13 @@ export default function Index() {
         <s-stack direction="block" gap="base">
           <s-box padding="base" borderWidth="base" borderRadius="base">
             <s-heading>{nextAction.message}</s-heading>
+          </s-box>
+          <s-box padding="base" borderWidth="base" borderRadius="base">
+            <s-heading>{materialsNextAction}</s-heading>
+            <s-paragraph>
+              Shopify owns products, variants, orders, and inventory records.
+              Operations Ledger adds item classification, BOMs, and MRP work.
+            </s-paragraph>
           </s-box>
           <s-stack direction="inline" gap="small">
             {dashboardFlowStages.map((stage, index) => (
@@ -660,6 +893,266 @@ export default function Index() {
               Demo: Run Supply Check
             </s-button>
           </Form>
+          <Form method="post">
+            <input type="hidden" name="intent" value="create-demo-kit-items" />
+            <s-button
+              type="submit"
+              variant="secondary"
+              {...(isSubmitting ? { loading: true } : {})}
+              disabled={!data.configured}
+            >
+              Demo: Create Demo Kit Items
+            </s-button>
+          </Form>
+          <Form method="post">
+            <input type="hidden" name="intent" value="create-demo-kit-bom" />
+            <s-button
+              type="submit"
+              variant="secondary"
+              {...(isSubmitting ? { loading: true } : {})}
+              disabled={!data.configured}
+            >
+              Demo: Create Demo Kit BOM
+            </s-button>
+          </Form>
+        </s-stack>
+      </s-section>
+
+      <s-section heading="Items / Materials">
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            Shopify variants stay the commerce source of record. Operations
+            Ledger only classifies those variants for material planning.
+          </s-paragraph>
+          {!data.materialItems.length && (
+            <EmptyState>
+              No operational item classifications yet. Create demo kit items or
+              import an order.
+            </EmptyState>
+          )}
+          {data.materialItems.map((item) => (
+            <s-box
+              key={item.id}
+              padding="base"
+              borderWidth="base"
+              borderRadius="base"
+            >
+              <s-stack direction="block" gap="small">
+                <s-paragraph>
+                  <s-text>{item.sku ?? "No SKU"}</s-text>
+                  <s-text> · {shortReference(item.shopifyVariantId)}</s-text>
+                </s-paragraph>
+                <s-paragraph>
+                  <s-text>{item.itemType}</s-text>
+                  <s-text> · unit {item.unit}</s-text>
+                  <s-text>
+                    {" "}
+                    · {item.isSellable ? "Sellable" : "Not sellable"}
+                  </s-text>
+                  <s-text>
+                    {" "}
+                    · {item.isPurchasable ? "Purchasable" : "Not purchasable"}
+                  </s-text>
+                  <s-text>
+                    {" "}
+                    · {item.isProducible ? "Producible" : "Not producible"}
+                  </s-text>
+                </s-paragraph>
+                <Form method="post">
+                  <input
+                    type="hidden"
+                    name="intent"
+                    value="update-item-settings"
+                  />
+                  <input type="hidden" name="itemId" value={item.id} />
+                  <s-stack direction="inline" gap="small">
+                    <label>
+                      Type{" "}
+                      <select name="itemType" defaultValue={item.itemType}>
+                        {itemTypes.map((itemType) => (
+                          <option key={itemType} value={itemType}>
+                            {itemType}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Unit{" "}
+                      <input
+                        name="unit"
+                        defaultValue={item.unit}
+                        size={6}
+                        aria-label={`${item.sku ?? item.id} unit`}
+                      />
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        name="isSellable"
+                        defaultChecked={item.isSellable}
+                      />{" "}
+                      Sellable
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        name="isPurchasable"
+                        defaultChecked={item.isPurchasable}
+                      />{" "}
+                      Purchasable
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        name="isProducible"
+                        defaultChecked={item.isProducible}
+                      />{" "}
+                      Producible
+                    </label>
+                    <s-button
+                      type="submit"
+                      variant="secondary"
+                      {...(isSubmitting ? { loading: true } : {})}
+                    >
+                      Save
+                    </s-button>
+                  </s-stack>
+                </Form>
+              </s-stack>
+            </s-box>
+          ))}
+        </s-stack>
+      </s-section>
+
+      <s-section heading="BOMs">
+        <s-stack direction="block" gap="base">
+          {!data.boms.length && (
+            <EmptyState>
+              No BOMs yet. Create the Demo Kit BOM to see component demand.
+            </EmptyState>
+          )}
+          {data.boms.map((bom) => (
+            <s-box
+              key={bom.id}
+              padding="base"
+              borderWidth="base"
+              borderRadius="base"
+            >
+              <s-stack direction="block" gap="small">
+                <s-paragraph>
+                  <s-text>{bom.parentSku ?? bom.parentVariantId}</s-text>
+                  <s-text> · version {bom.version}</s-text>
+                  <s-text> · {bom.isActive ? "Active" : "Inactive"}</s-text>
+                </s-paragraph>
+                {bom.lines.map((line) => (
+                  <s-paragraph key={line.id}>
+                    <s-text>
+                      {formatQuantity(line.quantity)} x{" "}
+                      {line.componentSku ?? line.componentVariantId}
+                    </s-text>
+                    <s-text> · {line.unit}</s-text>
+                    <s-text> · {line.componentItemType}</s-text>
+                  </s-paragraph>
+                ))}
+              </s-stack>
+            </s-box>
+          ))}
+        </s-stack>
+      </s-section>
+
+      <s-section heading="MRP Preview">
+        <s-stack direction="block" gap="base">
+          <Form method="post">
+            <input type="hidden" name="intent" value="run-mrp-preview" />
+            <s-button
+              type="submit"
+              variant="secondary"
+              {...(isSubmitting ? { loading: true } : {})}
+              disabled={!data.configured}
+            >
+              Run MRP Preview
+            </s-button>
+          </Form>
+          {!data.demoKitMrpPreview && (
+            <EmptyState>
+              Demo Kit MRP preview is waiting for demo kit items, BOM, and a
+              preview run.
+            </EmptyState>
+          )}
+          {data.demoKitMrpPreview && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-stack direction="block" gap="small">
+                <s-heading>1 x DEMO-KIT</s-heading>
+                {data.demoKitMrpPreview.mrpRunId && (
+                  <s-paragraph>
+                    <s-text>
+                      Preview run {shortReference(data.demoKitMrpPreview.mrpRunId)}
+                    </s-text>
+                    <s-text> · {data.demoKitMrpPreview.status}</s-text>
+                  </s-paragraph>
+                )}
+                <s-paragraph>
+                  <s-text>
+                    Finished item shortage:{" "}
+                    {formatQuantity(
+                      data.demoKitMrpPreview.parent.shortageQuantity,
+                    )}
+                  </s-text>
+                  <s-text>
+                    {" "}
+                    · {formatAction(data.demoKitMrpPreview.parent.action)}
+                  </s-text>
+                </s-paragraph>
+                {data.demoKitMrpPreview.components.map((line) => (
+                  <s-paragraph key={line.itemId}>
+                    <s-text>{line.sku ?? line.itemId}</s-text>
+                    <s-text>
+                      {" "}
+                      · required {formatQuantity(line.requiredQuantity)}
+                    </s-text>
+                    <s-text>
+                      {" "}
+                      · available {formatQuantity(line.availableQuantity)}
+                    </s-text>
+                    <s-text>
+                      {" "}
+                      · shortage {formatQuantity(line.shortageQuantity)}
+                    </s-text>
+                    <s-text> · {formatAction(line.action)}</s-text>
+                    {line.explanation && (
+                      <s-text> · {line.explanation}</s-text>
+                    )}
+                  </s-paragraph>
+                ))}
+                <s-paragraph>
+                  MRP Preview only writes mrp_runs and mrp_run_lines. It does
+                  not create purchase needs or production needs.
+                </s-paragraph>
+                {data.demoKitMrpPreview.mrpRunId && (
+                  <Form method="post">
+                    <input
+                      type="hidden"
+                      name="intent"
+                      value="commit-mrp-needs"
+                    />
+                    <input
+                      type="hidden"
+                      name="mrpRunId"
+                      value={data.demoKitMrpPreview.mrpRunId}
+                    />
+                    <s-button
+                      type="submit"
+                      variant="primary"
+                      {...(isSubmitting ? { loading: true } : {})}
+                      disabled={!data.configured}
+                    >
+                      Commit Needs from Preview
+                    </s-button>
+                  </Form>
+                )}
+              </s-stack>
+            </s-box>
+          )}
         </s-stack>
       </s-section>
 

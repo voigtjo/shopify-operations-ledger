@@ -7,6 +7,14 @@ const migration = readFileSync(
   resolve("supabase/migrations/20260428090000_item_bom_mrp_foundation.sql"),
   "utf8",
 ).toLowerCase();
+const mrpPreviewMigration = readFileSync(
+  resolve("supabase/migrations/20260501100000_mrp_preview_runs.sql"),
+  "utf8",
+).toLowerCase();
+const mrpCommitMigration = readFileSync(
+  resolve("supabase/migrations/20260501110000_mrp_commit_needs.sql"),
+  "utf8",
+).toLowerCase();
 
 describe("item, BOM, and MRP foundation migration", () => {
   it("creates item and BOM foundation tables", () => {
@@ -37,5 +45,26 @@ describe("item, BOM, and MRP foundation migration", () => {
   it("adds idempotent pending production needs", () => {
     expect(migration).toContain("production_needs_pending_reference_item_uidx");
     expect(migration).toContain("'pending'");
+  });
+
+  it("adds preview-only MRP run tables with canonical statuses and actions", () => {
+    expect(mrpPreviewMigration).toContain("create table public.mrp_runs");
+    expect(mrpPreviewMigration).toContain("create table public.mrp_run_lines");
+    expect(mrpPreviewMigration).toContain("status in ('draft', 'running', 'completed', 'failed', 'cancelled')");
+    expect(mrpPreviewMigration).toContain("recommended_action in ('none', 'reserve', 'purchase', 'produce', 'review')");
+    expect(mrpPreviewMigration).not.toContain("purchase_needs");
+    expect(mrpPreviewMigration).not.toContain("production_needs");
+  });
+
+  it("links explicit MRP commit output to needs without adding orders", () => {
+    expect(mrpCommitMigration).toContain("alter table public.purchase_needs");
+    expect(mrpCommitMigration).toContain("alter table public.production_needs");
+    expect(mrpCommitMigration).toContain("mrp_run_line_id");
+    expect(mrpCommitMigration).toContain("'open'");
+    expect(mrpCommitMigration).toContain("'pending'");
+    expect(mrpCommitMigration).toContain("purchase_needs_active_mrp_source_uidx");
+    expect(mrpCommitMigration).toContain("production_needs_pending_mrp_source_uidx");
+    expect(mrpCommitMigration).not.toContain("create table public.purchase_orders");
+    expect(mrpCommitMigration).not.toContain("create table public.production_orders");
   });
 });

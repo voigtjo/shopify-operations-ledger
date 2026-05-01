@@ -3,8 +3,16 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   calculateMaterialDemand,
+  commitMrpRunNeeds,
   createBom,
+  createDemoKitBom,
+  createDemoKitItems,
+  createProductionNeedsFromMrp,
+  createPurchaseNeedsFromMrp,
   ensureItemForShopifyVariant,
+  loadBomList,
+  previewDemoKitMrp,
+  validateBom,
   updateItemClassification,
 } from "../../app/lib/material-planning.server";
 import {
@@ -218,5 +226,324 @@ describeIfDatabase("item, BOM, and MRP foundation against local Supabase", () =>
 
     expect(result.createdPurchaseNeeds).toHaveLength(1);
     expect(result.createdProductionNeeds).toHaveLength(0);
+  });
+
+  it("creates demo kit items idempotently", async () => {
+    await createDemoKitItems(pool, ctx);
+    await createDemoKitItems(pool, ctx);
+
+    const result = await pool.query<{
+      item_count: string;
+      assembly_count: string;
+      purchasable_count: string;
+    }>(
+      `
+        select
+          count(*)::text as item_count,
+          count(*) filter (where sku = 'DEMO-KIT' and item_type = 'assembly' and is_producible = true)::text as assembly_count,
+          count(*) filter (where sku in ('BOX', 'COMPONENT-A', 'MANUAL') and is_purchasable = true)::text as purchasable_count
+        from public.items
+        where tenant_id = $1
+          and sku in ('DEMO-KIT', 'BOX', 'COMPONENT-A', 'MANUAL')
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(result.rows[0]).toEqual({
+      item_count: "4",
+      assembly_count: "1",
+      purchasable_count: "3",
+    });
+  });
+
+  it("creates demo kit BOM idempotently and loads parent lines", async () => {
+    await createDemoKitBom(pool, ctx);
+    await createDemoKitBom(pool, ctx);
+
+    const boms = await loadBomList(pool, ctx);
+    const demoBom = boms.find((bom) => bom.parentSku === "DEMO-KIT");
+
+    expect(demoBom).toBeTruthy();
+    expect(demoBom?.lines).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ componentSku: "BOX", quantity: 1 }),
+        expect.objectContaining({ componentSku: "COMPONENT-A", quantity: 2 }),
+        expect.objectContaining({ componentSku: "MANUAL", quantity: 1 }),
+      ]),
+    );
+
+    const counts = await pool.query<{
+      bom_count: string;
+      line_count: string;
+    }>(
+      `
+        select
+          count(distinct boms.id)::text as bom_count,
+          count(bom_lines.id)::text as line_count
+        from public.boms
+        join public.items
+          on items.id = boms.parent_item_id
+        left join public.bom_lines
+          on bom_lines.bom_id = boms.id
+        where boms.tenant_id = $1
+          and items.sku = 'DEMO-KIT'
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(counts.rows[0]).toEqual({
+      bom_count: "1",
+      line_count: "3",
+    });
+  });
+
+  it("rejects active BOMs when the parent is not producible", async () => {
+    const parent = await ensureItemForShopifyVariant(pool, ctx, {
+      shopifyVariantId: "gid://shopify/ProductVariant/non-producible-parent",
+      sku: "NON-PRODUCIBLE",
+    });
+    const component = await ensureItemForShopifyVariant(pool, ctx, {
+      shopifyVariantId: "gid://shopify/ProductVariant/non-producible-component",
+      sku: "NON-PRODUCIBLE-COMP",
+      isSellable: false,
+    });
+
+    await updateItemClassification(pool, ctx, {
+      itemId: component.itemId,
+      itemType: "component",
+    });
+
+    await expect(
+      createBom(pool, ctx, {
+        parentItemId: parent.itemId,
+        lines: [{ componentItemId: component.itemId, quantity: 1 }],
+      }),
+    ).rejects.toThrow("active_bom_parent_not_producible");
+  });
+
+  it("validates duplicate, invalid quantity, and cycle BOM lines", async () => {
+    const assemblyA = await ensureItemForShopifyVariant(pool, ctx, {
+      shopifyVariantId: "gid://shopify/ProductVariant/cycle-a",
+      sku: "CYCLE-A",
+    });
+    const assemblyB = await ensureItemForShopifyVariant(pool, ctx, {
+      shopifyVariantId: "gid://shopify/ProductVariant/cycle-b",
+      sku: "CYCLE-B",
+    });
+
+    await updateItemClassification(pool, ctx, {
+      itemId: assemblyA.itemId,
+      itemType: "assembly",
+    });
+    await updateItemClassification(pool, ctx, {
+      itemId: assemblyB.itemId,
+      itemType: "assembly",
+    });
+
+    const invalid = await validateBom(pool, ctx, {
+      parentItemId: assemblyA.itemId,
+      lines: [
+        { componentItemId: assemblyB.itemId, quantity: 0 },
+        { componentItemId: assemblyB.itemId, quantity: 1 },
+      ],
+    });
+
+    expect(invalid.valid).toBe(false);
+    expect(invalid.errors).toEqual(
+      expect.arrayContaining(["invalid_quantity", "duplicate_component_line"]),
+    );
+
+    await createBom(pool, ctx, {
+      parentItemId: assemblyA.itemId,
+      lines: [{ componentItemId: assemblyB.itemId, quantity: 1 }],
+    });
+
+    await expect(
+      createBom(pool, ctx, {
+        parentItemId: assemblyB.itemId,
+        lines: [{ componentItemId: assemblyA.itemId, quantity: 1 }],
+      }),
+    ).rejects.toThrow("bom_cycle_detected");
+  });
+
+  it("previews MRP demand for one Demo Kit", async () => {
+    await createDemoKitBom(pool, ctx);
+    await createInventoryAdjustment(pool, ctx, {
+      shopifyVariantId: "demo-variant:component-a",
+      sku: "COMPONENT-A",
+      title: "Component A",
+      quantityDelta: 1,
+      reason: "MRP preview partial availability test",
+    });
+
+    const preview = await previewDemoKitMrp(pool, ctx, 1);
+    const counts = await pool.query<{
+      mrp_run_count: string;
+      mrp_run_line_count: string;
+      purchase_need_count: string;
+      production_need_count: string;
+    }>(
+      `
+        select
+          (select count(*)::text from public.mrp_runs where tenant_id = $1) as mrp_run_count,
+          (select count(*)::text from public.mrp_run_lines where tenant_id = $1) as mrp_run_line_count,
+          (select count(*)::text from public.purchase_needs where tenant_id = $1) as purchase_need_count,
+          (select count(*)::text from public.production_needs where tenant_id = $1) as production_need_count
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(preview?.parent).toEqual(
+      expect.objectContaining({
+        sku: "DEMO-KIT",
+        requiredQuantity: 1,
+        shortageQuantity: 1,
+        action: "produce",
+      }),
+    );
+    expect(preview?.components).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sku: "BOX",
+          requiredQuantity: 1,
+          shortageQuantity: 1,
+          action: "purchase",
+        }),
+        expect.objectContaining({
+          sku: "COMPONENT-A",
+          requiredQuantity: 2,
+          availableQuantity: 1,
+          shortageQuantity: 1,
+          action: "purchase",
+        }),
+        expect.objectContaining({
+          sku: "MANUAL",
+          requiredQuantity: 1,
+          shortageQuantity: 1,
+          action: "purchase",
+        }),
+      ]),
+    );
+    expect(counts.rows[0]).toEqual({
+      mrp_run_count: "1",
+      mrp_run_line_count: "4",
+      purchase_need_count: "0",
+      production_need_count: "0",
+    });
+  });
+
+  it("commits purchase and production needs from a completed MRP Preview idempotently", async () => {
+    await createDemoKitBom(pool, ctx);
+    await createInventoryAdjustment(pool, ctx, {
+      shopifyVariantId: "demo-variant:component-a",
+      sku: "COMPONENT-A",
+      title: "Component A",
+      quantityDelta: 1,
+      reason: "MRP commit partial availability test",
+    });
+
+    const preview = await previewDemoKitMrp(pool, ctx, 1);
+
+    expect(preview?.mrpRunId).toBeTruthy();
+
+    const first = await commitMrpRunNeeds(pool, ctx, {
+      mrpRunId: preview!.mrpRunId!,
+    });
+    const second = await commitMrpRunNeeds(pool, ctx, {
+      mrpRunId: preview!.mrpRunId!,
+    });
+    const counts = await pool.query<{
+      purchase_need_count: string;
+      production_need_count: string;
+      purchase_order_count: string;
+      production_order_table_exists: string | null;
+    }>(
+      `
+        select
+          (select count(*)::text from public.purchase_needs where tenant_id = $1) as purchase_need_count,
+          (select count(*)::text from public.production_needs where tenant_id = $1) as production_need_count,
+          (select count(*)::text from public.purchase_orders where tenant_id = $1) as purchase_order_count,
+          to_regclass('public.production_orders')::text as production_order_table_exists
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(first.purchaseNeeds).toHaveLength(3);
+    expect(first.productionNeeds).toHaveLength(1);
+    expect(first.purchaseNeeds.every((need) => !need.alreadyCommitted)).toBe(
+      true,
+    );
+    expect(first.productionNeeds.every((need) => !need.alreadyCommitted)).toBe(
+      true,
+    );
+    expect(second.purchaseNeeds).toHaveLength(3);
+    expect(second.productionNeeds).toHaveLength(1);
+    expect(second.purchaseNeeds.every((need) => need.alreadyCommitted)).toBe(
+      true,
+    );
+    expect(second.productionNeeds.every((need) => need.alreadyCommitted)).toBe(
+      true,
+    );
+    expect(counts.rows[0]).toEqual({
+      purchase_need_count: "3",
+      production_need_count: "1",
+      purchase_order_count: "0",
+      production_order_table_exists: null,
+    });
+  });
+
+  it("can commit purchase and production needs through separate MRP services", async () => {
+    await createDemoKitBom(pool, ctx);
+    const preview = await previewDemoKitMrp(pool, ctx, 1);
+
+    const purchaseResult = await createPurchaseNeedsFromMrp(pool, ctx, {
+      mrpRunId: preview!.mrpRunId!,
+    });
+    const productionResult = await createProductionNeedsFromMrp(pool, ctx, {
+      mrpRunId: preview!.mrpRunId!,
+    });
+
+    expect(purchaseResult.purchaseNeeds).toHaveLength(3);
+    expect(productionResult.productionNeeds).toHaveLength(1);
+  });
+
+  it("runs demo kit supply check without duplicate purchase or production needs", async () => {
+    await createDemoKitBom(pool, ctx);
+
+    const imported = await importShopifyOrder(pool, {
+      shopDomain: testShopDomain,
+      shopifyOrderId: "gid://shopify/Order/demo-kit-mrp",
+      shopifyOrderName: "#DEMO-KIT-MRP",
+      lines: [
+        {
+          shopifyVariantId: "demo-variant:demo-kit",
+          sku: "DEMO-KIT",
+          title: "Demo Kit",
+          quantity: 1,
+        },
+      ],
+    });
+    const first = await runSupplyCheck(pool, ctx, imported.operationsOrderId);
+    const second = await runSupplyCheck(pool, ctx, imported.operationsOrderId);
+    const counts = await pool.query<{
+      production_need_count: string;
+      purchase_need_count: string;
+    }>(
+      `
+        select
+          (select count(*)::text from public.production_needs where tenant_id = $1) as production_need_count,
+          (select count(*)::text from public.purchase_needs where tenant_id = $1) as purchase_need_count
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(first.createdProductionNeeds).toHaveLength(1);
+    expect(first.createdPurchaseNeeds).toHaveLength(3);
+    expect(second.createdProductionNeeds).toHaveLength(0);
+    expect(second.createdPurchaseNeeds).toHaveLength(0);
+    expect(counts.rows[0]).toEqual({
+      production_need_count: "1",
+      purchase_need_count: "3",
+    });
   });
 });
