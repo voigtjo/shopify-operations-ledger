@@ -15,6 +15,10 @@ const mrpCommitMigration = readFileSync(
   resolve("supabase/migrations/20260501110000_mrp_commit_needs.sql"),
   "utf8",
 ).toLowerCase();
+const purchaseNeedWorkflowMigration = readFileSync(
+  resolve("supabase/migrations/20260501130000_purchase_need_supplier_workflow.sql"),
+  "utf8",
+).toLowerCase();
 
 describe("item, BOM, and MRP foundation migration", () => {
   it("creates item and BOM foundation tables", () => {
@@ -66,5 +70,14 @@ describe("item, BOM, and MRP foundation migration", () => {
     expect(mrpCommitMigration).toContain("production_needs_pending_mrp_source_uidx");
     expect(mrpCommitMigration).not.toContain("create table public.purchase_orders");
     expect(mrpCommitMigration).not.toContain("create table public.production_orders");
+  });
+
+  it("adds supplier assignment and PO draft preparation fields without adding final PO behavior", () => {
+    expect(purchaseNeedWorkflowMigration).toContain("create table if not exists public.supplier_items");
+    expect(purchaseNeedWorkflowMigration).toContain("assigned_supplier_id");
+    expect(purchaseNeedWorkflowMigration).toContain("ready_for_po_draft_at");
+    expect(purchaseNeedWorkflowMigration).toContain("supplier_items_one_preferred_active_item_uidx");
+    expect(purchaseNeedWorkflowMigration).not.toContain("create table public.purchase_orders");
+    expect(purchaseNeedWorkflowMigration).not.toContain("goods_receipts");
   });
 });

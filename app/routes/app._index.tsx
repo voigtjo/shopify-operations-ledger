@@ -14,6 +14,7 @@ import {
   loadNeedsBoard,
   runDemoKitMrpPreview,
 } from "../lib/material-planning.server";
+import { loadPurchaseNeedsSummary } from "../lib/purchase-needs.server";
 import { formatQuantity, formatStatus, shortReference } from "../lib/ui-format";
 
 type ActionResult = {
@@ -38,6 +39,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       activeBomCount: 0,
       latestMrpRun: null,
       openPurchaseNeedCount: 0,
+      missingSupplierPurchaseNeedCount: 0,
+      preferredSupplierAvailablePurchaseNeedCount: 0,
+      readyForPoDraftPurchaseNeedCount: 0,
       openProductionNeedCount: 0,
       demoPreview: null,
       hasDemoItems: false,
@@ -45,13 +49,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     };
   }
 
-  const [items, boms, runs, needs, demoPreview] = await Promise.all([
-    loadItemList(context.pool, context.ctx, { limit: 200 }),
-    loadBomList(context.pool, context.ctx),
-    loadMrpRunList(context.pool, context.ctx, { limit: 1 }),
-    loadNeedsBoard(context.pool, context.ctx),
-    loadLatestDemoKitMrpPreview(context.pool, context.ctx),
-  ]);
+  const [items, boms, runs, needs, purchaseNeedSummary, demoPreview] =
+    await Promise.all([
+      loadItemList(context.pool, context.ctx, { limit: 200 }),
+      loadBomList(context.pool, context.ctx),
+      loadMrpRunList(context.pool, context.ctx, { limit: 1 }),
+      loadNeedsBoard(context.pool, context.ctx),
+      loadPurchaseNeedsSummary(context.pool, context.ctx),
+      loadLatestDemoKitMrpPreview(context.pool, context.ctx),
+    ]);
 
   return {
     configured: true as const,
@@ -59,9 +65,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     itemCount: items.length,
     activeBomCount: boms.filter((bom) => bom.isActive).length,
     latestMrpRun: runs[0] ?? null,
-    openPurchaseNeedCount: needs.purchaseNeeds.filter((need) =>
-      ["open", "OPEN"].includes(need.status),
-    ).length,
+    openPurchaseNeedCount: purchaseNeedSummary.openPurchaseNeeds,
+    missingSupplierPurchaseNeedCount:
+      purchaseNeedSummary.missingSupplierPurchaseNeeds,
+    preferredSupplierAvailablePurchaseNeedCount:
+      purchaseNeedSummary.preferredSupplierAvailablePurchaseNeeds,
+    readyForPoDraftPurchaseNeedCount:
+      purchaseNeedSummary.readyForPoDraftPurchaseNeeds,
     openProductionNeedCount: needs.productionNeeds.filter((need) =>
       ["pending", "PENDING"].includes(need.status),
     ).length,
@@ -300,7 +310,42 @@ export default function Dashboard() {
                 {data.openPurchaseNeedCount} purchase need
                 {data.openPurchaseNeedCount === 1 ? "" : "s"} waiting.
               </s-paragraph>
-              <s-link href="/app/needs">Open Needs</s-link>
+              <s-link href="/app/needs">Open Purchase Needs board</s-link>
+            </s-box>
+          )}
+          {data.missingSupplierPurchaseNeedCount > 0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                {data.missingSupplierPurchaseNeedCount} purchase need
+                {data.missingSupplierPurchaseNeedCount === 1 ? "" : "s"} need
+                {data.missingSupplierPurchaseNeedCount === 1 ? "s" : ""} a
+                supplier assignment.
+              </s-paragraph>
+              <s-link href="/app/needs?filter=open">Assign suppliers</s-link>
+            </s-box>
+          )}
+          {data.preferredSupplierAvailablePurchaseNeedCount > 0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                {data.preferredSupplierAvailablePurchaseNeedCount} purchase need
+                {data.preferredSupplierAvailablePurchaseNeedCount === 1
+                  ? " has"
+                  : "s have"}{" "}
+                a preferred supplier available.
+              </s-paragraph>
+              <s-link href="/app/needs?filter=open">
+                Assign preferred suppliers
+              </s-link>
+            </s-box>
+          )}
+          {data.readyForPoDraftPurchaseNeedCount > 0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                {data.readyForPoDraftPurchaseNeedCount} purchase need
+                {data.readyForPoDraftPurchaseNeedCount === 1 ? "" : "s"} ready
+                for PO draft preview.
+              </s-paragraph>
+              <s-link href="/app/needs/po-draft">Prepare PO Draft</s-link>
             </s-box>
           )}
           {data.openProductionNeedCount > 0 && (

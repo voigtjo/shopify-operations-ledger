@@ -30,6 +30,7 @@ export default function App() {
         <s-link href="/app/boms">BOMs</s-link>
         <s-link href="/app/mrp">MRP</s-link>
         <s-link href="/app/needs">Needs</s-link>
+        <s-link href="/app/suppliers">Suppliers</s-link>
         <s-link href="/app/settings">Settings</s-link>
       </s-app-nav>
       <Outlet />

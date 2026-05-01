@@ -21,6 +21,18 @@ import {
   runSupplyCheck,
   type TenantContext,
 } from "../../app/lib/operational-core.server";
+import {
+  assignPreferredSupplierToPurchaseNeed,
+  assignSupplierToPurchaseNeed,
+  createSupplier,
+  linkSupplierToItem,
+  listPurchaseNeedsBoard,
+  listSupplierItemLinks,
+  markPurchaseNeedReadyForPo,
+  preparePurchaseOrderDraftPreview,
+  setSupplierActive,
+  updateSupplier,
+} from "../../app/lib/purchase-needs.server";
 
 const connectionString = process.env.OPERATIONS_LEDGER_DATABASE_URL;
 const describeIfDatabase = connectionString ? describe : describe.skip;
@@ -505,6 +517,172 @@ describeIfDatabase("item, BOM, and MRP foundation against local Supabase", () =>
 
     expect(purchaseResult.purchaseNeeds).toHaveLength(3);
     expect(productionResult.productionNeeds).toHaveLength(1);
+  });
+
+  it("assigns suppliers and groups ready purchase needs into a PO draft preview", async () => {
+    await createDemoKitBom(pool, ctx);
+    const preview = await previewDemoKitMrp(pool, ctx, 1);
+    await commitMrpRunNeeds(pool, ctx, {
+      mrpRunId: preview!.mrpRunId!,
+    });
+    const supplier = await createSupplier(pool, ctx, {
+      name: "Demo Components Supplier",
+      email: "buyer@example.com",
+    });
+    const needs = await pool.query<{ id: string }>(
+      `
+        select id
+        from public.purchase_needs
+        where tenant_id = $1
+        order by created_at asc
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(needs.rows).toHaveLength(3);
+
+    for (const need of needs.rows) {
+      await assignSupplierToPurchaseNeed(pool, ctx, {
+        purchaseNeedId: need.id,
+        supplierId: supplier.id,
+        rememberForItem: true,
+      });
+      await markPurchaseNeedReadyForPo(pool, ctx, {
+        purchaseNeedId: need.id,
+      });
+    }
+
+    const previewGroups = await preparePurchaseOrderDraftPreview(pool, ctx);
+    const counts = await pool.query<{ purchase_order_count: string }>(
+      `
+        select count(*)::text as purchase_order_count
+        from public.purchase_orders
+        where tenant_id = $1
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(previewGroups.groups).toHaveLength(1);
+    expect(previewGroups.groups[0]).toEqual(
+      expect.objectContaining({
+        supplierName: "Demo Components Supplier",
+        supplierEmail: "buyer@example.com",
+        needCount: 3,
+      }),
+    );
+    expect(previewGroups.groups[0]!.lines).toHaveLength(3);
+    expect(counts.rows[0]).toEqual({ purchase_order_count: "0" });
+  });
+
+  it("rejects inactive suppliers for purchase need assignment", async () => {
+    await createDemoKitBom(pool, ctx);
+    const preview = await previewDemoKitMrp(pool, ctx, 1);
+    const committed = await commitMrpRunNeeds(pool, ctx, {
+      mrpRunId: preview!.mrpRunId!,
+    });
+    const inactiveSupplier = await createSupplier(pool, ctx, {
+      name: "Inactive Supplier",
+    });
+
+    await setSupplierActive(pool, ctx, {
+      supplierId: inactiveSupplier.id,
+      active: false,
+    });
+
+    await expect(
+      assignSupplierToPurchaseNeed(pool, ctx, {
+        purchaseNeedId: committed.purchaseNeeds[0]!.id,
+        supplierId: inactiveSupplier.id,
+      }),
+    ).rejects.toThrow("supplier_inactive");
+  });
+
+  it("updates suppliers, links preferred item suppliers, and assigns the preferred supplier to a purchase need", async () => {
+    await createDemoKitBom(pool, ctx);
+    const preview = await previewDemoKitMrp(pool, ctx, 1);
+    await commitMrpRunNeeds(pool, ctx, {
+      mrpRunId: preview!.mrpRunId!,
+    });
+    const supplier = await createSupplier(pool, ctx, {
+      name: "Preferred Box Supplier",
+      email: "old@example.com",
+    });
+    const updated = await updateSupplier(pool, ctx, {
+      supplierId: supplier.id,
+      name: "Preferred Box Supplier",
+      email: "new@example.com",
+    });
+    const boxNeed = await pool.query<{ id: string; item_id: string }>(
+      `
+        select id, item_id
+        from public.purchase_needs
+        where tenant_id = $1
+          and sku = 'BOX'
+        limit 1
+      `,
+      [ctx.tenantId],
+    );
+
+    await linkSupplierToItem(pool, ctx, {
+      supplierId: supplier.id,
+      itemId: boxNeed.rows[0]!.item_id,
+      supplierSku: "SUP-BOX",
+      purchaseUnit: "pcs",
+      isPreferred: true,
+    });
+
+    const links = await listSupplierItemLinks(pool, ctx);
+    const boardBeforeAssignment = await listPurchaseNeedsBoard(pool, ctx, {
+      filter: "open",
+    });
+    const boxBoardNeed = boardBeforeAssignment.purchaseNeeds.find(
+      (need) => need.id === boxNeed.rows[0]!.id,
+    );
+
+    await assignPreferredSupplierToPurchaseNeed(pool, ctx, {
+      purchaseNeedId: boxNeed.rows[0]!.id,
+    });
+
+    const boardAfterAssignment = await listPurchaseNeedsBoard(pool, ctx, {
+      filter: "open",
+    });
+    const assignedBoxNeed = boardAfterAssignment.purchaseNeeds.find(
+      (need) => need.id === boxNeed.rows[0]!.id,
+    );
+    const counts = await pool.query<{ purchase_order_count: string }>(
+      `
+        select count(*)::text as purchase_order_count
+        from public.purchase_orders
+        where tenant_id = $1
+      `,
+      [ctx.tenantId],
+    );
+
+    expect(updated.email).toBe("new@example.com");
+    expect(links).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          supplierName: "Preferred Box Supplier",
+          itemSku: "BOX",
+          supplierSku: "SUP-BOX",
+          isPreferred: true,
+          active: true,
+        }),
+      ]),
+    );
+    expect(boxBoardNeed).toEqual(
+      expect.objectContaining({
+        recommendedSupplierId: supplier.id,
+        recommendedSupplierName: "Preferred Box Supplier",
+      }),
+    );
+    expect(assignedBoxNeed).toEqual(
+      expect.objectContaining({
+        assignedSupplierId: supplier.id,
+        assignedSupplierName: "Preferred Box Supplier",
+      }),
+    );
+    expect(counts.rows[0]).toEqual({ purchase_order_count: "0" });
   });
 
   it("runs demo kit supply check without duplicate purchase or production needs", async () => {
