@@ -112,6 +112,7 @@ export interface BomValidationResult {
 interface ItemPlanningRow {
   id: string;
   sku: string | null;
+  shopify_variant_id: string;
   item_type: ItemType;
   unit: string;
   is_sellable: boolean;
@@ -293,8 +294,8 @@ export async function loadItemList(
     `
       select id,
              shopify_product_id,
-             shopify_variant_id,
              sku,
+             shopify_variant_id,
              item_type,
              unit,
              is_sellable,
@@ -1575,6 +1576,396 @@ export async function commitMrpRunNeeds(
     purchaseNeeds: purchaseResult.purchaseNeeds,
     productionNeeds: productionResult.productionNeeds,
     skippedLines: Array.from(skippedLinesById.values()),
+  };
+}
+
+export async function loadItemDetail(
+  db: QueryExecutor,
+  ctx: MaterialTenantContext,
+  itemId: string,
+) {
+  const item = await loadItemPlanningRow(db, ctx, itemId);
+
+  if (!item) {
+    throw new Error("item_not_found");
+  }
+
+  const availableQuantity = await getAvailableQuantity(db, ctx, itemId);
+  const relatedBom = await db.query<{
+    id: string;
+    version: string;
+    is_active: boolean;
+  }>(
+    `
+      select id, version, is_active
+      from public.boms
+      where tenant_id = $1
+        and parent_item_id = $2
+      order by is_active desc, created_at desc
+      limit 1
+    `,
+    [ctx.tenantId, itemId],
+  );
+  const mrpLines = await db.query<{
+    id: string;
+    mrp_run_id: string;
+    required_quantity: string;
+    shortage_quantity: string;
+    recommended_action: MrpRecommendedAction;
+    created_at: Date;
+  }>(
+    `
+      select id,
+             mrp_run_id,
+             required_quantity::text,
+             shortage_quantity::text,
+             recommended_action,
+             created_at
+      from public.mrp_run_lines
+      where tenant_id = $1
+        and item_id = $2
+      order by created_at desc
+      limit 10
+    `,
+    [ctx.tenantId, itemId],
+  );
+
+  return {
+    id: item.id,
+    sku: item.sku,
+    shopifyVariantId: item.shopify_variant_id,
+    itemType: item.item_type,
+    unit: item.unit,
+    isSellable: item.is_sellable,
+    isPurchasable: item.is_purchasable,
+    isProducible: item.is_producible,
+    canBeBomParent: item.is_producible,
+    canBeComponent: item.item_type !== "product" || item.is_purchasable,
+    availableQuantity,
+    relatedBom: relatedBom.rows[0] ?? null,
+    mrpLines: mrpLines.rows.map((line) => ({
+      id: line.id,
+      mrpRunId: line.mrp_run_id,
+      requiredQuantity: toNumber(line.required_quantity),
+      shortageQuantity: toNumber(line.shortage_quantity),
+      recommendedAction: line.recommended_action,
+      createdAt: line.created_at.toISOString(),
+    })),
+  };
+}
+
+export async function loadBomDetail(
+  db: QueryExecutor,
+  ctx: MaterialTenantContext,
+  bomId: string,
+) {
+  const bom = await db.query<{
+    id: string;
+    parent_item_id: string;
+    parent_sku: string | null;
+    parent_item_type: ItemType;
+    parent_is_producible: boolean;
+    version: string;
+    is_active: boolean;
+  }>(
+    `
+      select boms.id,
+             boms.parent_item_id,
+             items.sku as parent_sku,
+             items.item_type as parent_item_type,
+             items.is_producible as parent_is_producible,
+             boms.version,
+             boms.is_active
+      from public.boms
+      join public.items
+        on items.id = boms.parent_item_id
+      where boms.tenant_id = $1
+        and boms.id = $2
+      limit 1
+    `,
+    [ctx.tenantId, bomId],
+  );
+  const row = bom.rows[0];
+
+  if (!row) {
+    throw new Error("bom_not_found");
+  }
+
+  const lines = await db.query<{
+    id: string;
+    component_item_id: string;
+    sku: string | null;
+    item_type: ItemType;
+    quantity: string;
+    unit: string;
+  }>(
+    `
+      select bom_lines.id,
+             bom_lines.component_item_id,
+             items.sku,
+             items.item_type,
+             bom_lines.quantity::text,
+             bom_lines.unit
+      from public.bom_lines
+      join public.items
+        on items.id = bom_lines.component_item_id
+      where bom_lines.bom_id = $1
+      order by bom_lines.created_at asc
+    `,
+    [bomId],
+  );
+  const validation = await validateBom(db, ctx, {
+    parentItemId: row.parent_item_id,
+    isActive: row.is_active,
+    lines: lines.rows.map((line) => ({
+      componentItemId: line.component_item_id,
+      quantity: toNumber(line.quantity),
+      unit: line.unit,
+    })),
+  });
+
+  return {
+    id: row.id,
+    parentItemId: row.parent_item_id,
+    parentSku: row.parent_sku,
+    parentItemType: row.parent_item_type,
+    parentIsProducible: row.parent_is_producible,
+    version: row.version,
+    isActive: row.is_active,
+    validation,
+    lines: lines.rows.map((line) => ({
+      id: line.id,
+      componentItemId: line.component_item_id,
+      componentSku: line.sku,
+      componentItemType: line.item_type,
+      quantity: toNumber(line.quantity),
+      unit: line.unit,
+    })),
+  };
+}
+
+export async function loadMrpRunList(
+  db: QueryExecutor,
+  ctx: MaterialTenantContext,
+  options: { limit?: number } = {},
+) {
+  const runs = await db.query<{
+    id: string;
+    run_number: string;
+    status: string;
+    created_at: Date;
+    line_count: string;
+    committed_count: string;
+  }>(
+    `
+      select mrp_runs.id,
+             mrp_runs.run_number,
+             mrp_runs.status,
+             mrp_runs.created_at,
+             count(mrp_run_lines.id)::text as line_count,
+             count(mrp_run_lines.id) filter (
+               where mrp_run_lines.purchase_need_id is not null
+                  or mrp_run_lines.production_need_id is not null
+             )::text as committed_count
+      from public.mrp_runs
+      left join public.mrp_run_lines
+        on mrp_run_lines.mrp_run_id = mrp_runs.id
+      where mrp_runs.tenant_id = $1
+      group by mrp_runs.id
+      order by mrp_runs.created_at desc
+      limit $2
+    `,
+    [ctx.tenantId, options.limit ?? 25],
+  );
+
+  return runs.rows.map((run) => ({
+    id: run.id,
+    runNumber: run.run_number,
+    status: run.status,
+    createdAt: run.created_at.toISOString(),
+    lineCount: toNumber(run.line_count),
+    committedCount: toNumber(run.committed_count),
+    needsCommitted: toNumber(run.committed_count) > 0,
+  }));
+}
+
+export async function loadMrpRunDetail(
+  db: QueryExecutor,
+  ctx: MaterialTenantContext,
+  mrpRunId: string,
+) {
+  const run = await db.query<{
+    id: string;
+    run_number: string;
+    status: string;
+    demand_source_type: string;
+    demand_source_id: string;
+    created_at: Date;
+  }>(
+    `
+      select id, run_number, status, demand_source_type, demand_source_id, created_at
+      from public.mrp_runs
+      where tenant_id = $1
+        and id = $2
+      limit 1
+    `,
+    [ctx.tenantId, mrpRunId],
+  );
+  const row = run.rows[0];
+
+  if (!row) {
+    throw new Error("mrp_run_not_found");
+  }
+
+  const lines = await db.query<{
+    id: string;
+    item_id: string;
+    sku: string | null;
+    required_quantity: string;
+    available_quantity: string;
+    reserved_quantity: string;
+    shortage_quantity: string;
+    recommended_action: MrpRecommendedAction;
+    explanation: string;
+    purchase_need_id: string | null;
+    production_need_id: string | null;
+  }>(
+    `
+      select mrp_run_lines.id,
+             mrp_run_lines.item_id,
+             items.sku,
+             mrp_run_lines.required_quantity::text,
+             mrp_run_lines.available_quantity::text,
+             mrp_run_lines.reserved_quantity::text,
+             mrp_run_lines.shortage_quantity::text,
+             mrp_run_lines.recommended_action,
+             mrp_run_lines.explanation,
+             mrp_run_lines.purchase_need_id,
+             mrp_run_lines.production_need_id
+      from public.mrp_run_lines
+      join public.items
+        on items.id = mrp_run_lines.item_id
+      where mrp_run_lines.tenant_id = $1
+        and mrp_run_lines.mrp_run_id = $2
+      order by mrp_run_lines.line_number asc
+    `,
+    [ctx.tenantId, mrpRunId],
+  );
+
+  return {
+    id: row.id,
+    runNumber: row.run_number,
+    status: row.status,
+    demandSourceType: row.demand_source_type,
+    demandSourceId: row.demand_source_id,
+    createdAt: row.created_at.toISOString(),
+    lines: lines.rows.map((line) => ({
+      id: line.id,
+      itemId: line.item_id,
+      sku: line.sku,
+      requiredQuantity: toNumber(line.required_quantity),
+      availableQuantity: toNumber(line.available_quantity),
+      reservedQuantity: toNumber(line.reserved_quantity),
+      shortageQuantity: toNumber(line.shortage_quantity),
+      recommendedAction: line.recommended_action,
+      explanation: line.explanation,
+      purchaseNeedId: line.purchase_need_id,
+      productionNeedId: line.production_need_id,
+      committed: Boolean(line.purchase_need_id || line.production_need_id),
+    })),
+  };
+}
+
+export async function loadNeedsBoard(
+  db: QueryExecutor,
+  ctx: MaterialTenantContext,
+) {
+  const purchaseNeeds = await db.query<{
+    id: string;
+    item_id: string | null;
+    sku: string | null;
+    title: string;
+    quantity_needed: string;
+    quantity_covered: string;
+    status: string;
+    source_id: string | null;
+    mrp_run_id: string | null;
+    created_at: Date;
+  }>(
+    `
+      select purchase_needs.id,
+             purchase_needs.item_id,
+             purchase_needs.sku,
+             purchase_needs.title,
+             purchase_needs.quantity_needed::text,
+             purchase_needs.quantity_covered::text,
+             purchase_needs.status,
+             purchase_needs.source_id,
+             mrp_run_lines.mrp_run_id,
+             purchase_needs.created_at
+      from public.purchase_needs
+      left join public.mrp_run_lines
+        on mrp_run_lines.id = purchase_needs.mrp_run_line_id
+      where purchase_needs.tenant_id = $1
+      order by purchase_needs.created_at desc
+      limit 50
+    `,
+    [ctx.tenantId],
+  );
+  const productionNeeds = await db.query<{
+    id: string;
+    item_id: string;
+    sku: string | null;
+    required_quantity: string;
+    status: string;
+    source_id: string | null;
+    mrp_run_id: string | null;
+    created_at: Date;
+  }>(
+    `
+      select production_needs.id,
+             production_needs.item_id,
+             items.sku,
+             production_needs.required_quantity::text,
+             production_needs.status,
+             production_needs.source_id,
+             mrp_run_lines.mrp_run_id,
+             production_needs.created_at
+      from public.production_needs
+      join public.items
+        on items.id = production_needs.item_id
+      left join public.mrp_run_lines
+        on mrp_run_lines.id = production_needs.mrp_run_line_id
+      where production_needs.tenant_id = $1
+      order by production_needs.created_at desc
+      limit 50
+    `,
+    [ctx.tenantId],
+  );
+
+  return {
+    purchaseNeeds: purchaseNeeds.rows.map((need) => ({
+      id: need.id,
+      itemId: need.item_id,
+      sku: need.sku,
+      title: need.title,
+      quantityNeeded: toNumber(need.quantity_needed),
+      quantityCovered: toNumber(need.quantity_covered),
+      status: need.status,
+      sourceId: need.source_id,
+      mrpRunId: need.mrp_run_id,
+      createdAt: need.created_at.toISOString(),
+    })),
+    productionNeeds: productionNeeds.rows.map((need) => ({
+      id: need.id,
+      itemId: need.item_id,
+      sku: need.sku,
+      requiredQuantity: toNumber(need.required_quantity),
+      status: need.status,
+      sourceId: need.source_id,
+      mrpRunId: need.mrp_run_id,
+      createdAt: need.created_at.toISOString(),
+    })),
   };
 }
 

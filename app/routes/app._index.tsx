@@ -1,73 +1,25 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
 
+import { PlanningEmptyState } from "../components/PlanningEmptyState";
+import { requirePlanningContext } from "../lib/app-context.server";
 import {
-  dashboardFlowStages,
-  getDashboardNextAction,
-} from "../lib/dashboard-presentation";
-import { getFoundationDatabasePool } from "../lib/foundation-db.server";
-import {
+  commitMrpRunNeeds,
   createDemoKitBom,
   createDemoKitItems,
   loadBomList,
   loadItemList,
   loadLatestDemoKitMrpPreview,
+  loadMrpRunList,
+  loadNeedsBoard,
   runDemoKitMrpPreview,
-  updateItemClassification,
-  type ItemType,
-  type MrpPreviewLine,
-  type BomSummary,
-  type ItemSummary,
-  type DemoKitMrpPreview,
-  type MrpNeedCommitResult,
-  commitMrpRunNeeds,
 } from "../lib/material-planning.server";
-import {
-  createDemoOperationalCases,
-  loadCaseList,
-  loadRecentCaseEvents,
-} from "../lib/operational-case.server";
-import {
-  buildDemoShopifyOrderPayload,
-  createPurchaseOrderFromNeeds,
-  createSupplier,
-  getImportedShopifyOrderRefs,
-  getTenantContextByShopDomain,
-  importShopifyOrder,
-  postGoodsReceipt,
-  runSupplyCheck,
-  sendPurchaseOrder,
-} from "../lib/operational-core.server";
-import { loadDashboardForShop } from "../lib/operations-dashboard.server";
-import {
-  fetchRecentShopifyOrders,
-  fetchShopifyOrderById,
-  importShopifyOrderWithSupplyCheck,
-} from "../lib/shopify-orders.server";
-import {
-  PgTenantBootstrapStore,
-  bootstrapTenantFromShopifySession,
-} from "../lib/tenant-bootstrap.server";
-import { authenticate } from "../shopify.server";
+import { formatQuantity, formatStatus, shortReference } from "../lib/ui-format";
 
-type ActionResult =
-  | { ok: true; message: string; commitResult?: MrpNeedCommitResult }
-  | { ok: false; message: string };
-
-type ShopifyOrderForDashboard = Awaited<
-  ReturnType<typeof fetchRecentShopifyOrders>
->[number] & {
-  imported: boolean;
-  operationsOrderId: string | null;
-  operationsOrderStatus: string | null;
+type ActionResult = {
+  ok: boolean;
+  message: string;
 };
-
-const itemTypes: ItemType[] = [
-  "product",
-  "component",
-  "raw_material",
-  "assembly",
-];
 
 function formString(formData: FormData, key: string) {
   const value = formData.get(key);
@@ -75,228 +27,89 @@ function formString(formData: FormData, key: string) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-async function getRemainingReceiptLines(
-  pool: ReturnType<typeof getFoundationDatabasePool>,
-  tenantId: string,
-  purchaseOrderId: string,
-) {
-  if (!pool) {
-    return [];
-  }
-
-  const linesResult = await pool.query<{
-    id: string;
-    quantity_remaining: string;
-  }>(
-    `
-      select id, (quantity_ordered - quantity_received)::text as quantity_remaining
-      from public.purchase_order_lines
-      where tenant_id = $1
-        and purchase_order_id = $2
-        and quantity_received < quantity_ordered
-      order by created_at asc
-    `,
-    [tenantId, purchaseOrderId],
-  );
-
-  return linesResult.rows.map((line) => ({
-    purchaseOrderLineId: line.id,
-    quantityReceived: Number(line.quantity_remaining),
-  }));
-}
-
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
-  const dashboardState = await loadDashboardForShop({
-    shopDomain: session.shop,
-    accessToken: session.accessToken,
-    scopes: session.scope,
-  });
-  let shopifyOrders: ShopifyOrderForDashboard[] = [];
-  let shopifyOrdersError: string | null = null;
-  let operationCases: Awaited<ReturnType<typeof loadCaseList>> = [];
-  let recentCaseEvents: Awaited<ReturnType<typeof loadRecentCaseEvents>> = [];
-  let materialItems: ItemSummary[] = [];
-  let boms: BomSummary[] = [];
-  let demoKitMrpPreview: DemoKitMrpPreview | null = null;
+  const context = await requirePlanningContext(request);
 
-  try {
-    const recentOrders = await fetchRecentShopifyOrders(admin, 10);
-    const pool = getFoundationDatabasePool();
-
-    if (pool && dashboardState.configured) {
-      const ctx = await getTenantContextByShopDomain(pool, session.shop);
-      const importedRefs = await getImportedShopifyOrderRefs(
-        pool,
-        ctx,
-        recentOrders.map((order) => order.id),
-      );
-
-      shopifyOrders = recentOrders.map((order) => {
-        const imported = importedRefs.get(order.id);
-
-        return {
-          ...order,
-          imported: Boolean(imported),
-          operationsOrderId: imported?.operationsOrderId ?? null,
-          operationsOrderStatus: imported?.operationsOrderStatus ?? null,
-        };
-      });
-    } else {
-      shopifyOrders = recentOrders.map((order) => ({
-        ...order,
-        imported: false,
-        operationsOrderId: null,
-        operationsOrderStatus: null,
-      }));
-    }
-  } catch (error) {
-    shopifyOrdersError =
-      error instanceof Error ? error.message : "Unable to load Shopify orders.";
+  if (!context.configured) {
+    return {
+      configured: false as const,
+      shopDomain: context.shopDomain,
+      itemCount: 0,
+      activeBomCount: 0,
+      latestMrpRun: null,
+      openPurchaseNeedCount: 0,
+      openProductionNeedCount: 0,
+      demoPreview: null,
+      hasDemoItems: false,
+      hasDemoBom: false,
+    };
   }
 
-  if (dashboardState.configured) {
-    const pool = getFoundationDatabasePool();
-
-    if (pool) {
-      const ctx = await getTenantContextByShopDomain(pool, session.shop);
-
-      operationCases = await loadCaseList(pool, ctx, { limit: 12 });
-      recentCaseEvents = await loadRecentCaseEvents(pool, ctx, { limit: 8 });
-      materialItems = await loadItemList(pool, ctx, { limit: 50 });
-      boms = await loadBomList(pool, ctx);
-      demoKitMrpPreview = await loadLatestDemoKitMrpPreview(pool, ctx);
-    }
-  }
+  const [items, boms, runs, needs, demoPreview] = await Promise.all([
+    loadItemList(context.pool, context.ctx, { limit: 200 }),
+    loadBomList(context.pool, context.ctx),
+    loadMrpRunList(context.pool, context.ctx, { limit: 1 }),
+    loadNeedsBoard(context.pool, context.ctx),
+    loadLatestDemoKitMrpPreview(context.pool, context.ctx),
+  ]);
 
   return {
-    ...dashboardState,
-    shopifyOrders,
-    shopifyOrdersError,
-    operationCases,
-    recentCaseEvents,
-    materialItems,
-    boms,
-    demoKitMrpPreview,
+    configured: true as const,
+    shopDomain: context.shopDomain,
+    itemCount: items.length,
+    activeBomCount: boms.filter((bom) => bom.isActive).length,
+    latestMrpRun: runs[0] ?? null,
+    openPurchaseNeedCount: needs.purchaseNeeds.filter((need) =>
+      ["open", "OPEN"].includes(need.status),
+    ).length,
+    openProductionNeedCount: needs.productionNeeds.filter((need) =>
+      ["pending", "PENDING"].includes(need.status),
+    ).length,
+    demoPreview,
+    hasDemoItems: items.some((item) => item.sku === "DEMO-KIT"),
+    hasDemoBom: boms.some((bom) => bom.parentSku === "DEMO-KIT"),
   };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const context = await requirePlanningContext(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
-  const pool = getFoundationDatabasePool();
 
-  if (!pool) {
+  if (!context.configured) {
     return {
       ok: false,
       message:
-        "Operations Ledger database is not configured. Set OPERATIONS_LEDGER_DATABASE_URL for local verification.",
-    } satisfies ActionResult;
-  }
-
-  if (!session.accessToken) {
-    throw new Error("Shopify session did not include an access token");
-  }
-
-  await bootstrapTenantFromShopifySession(new PgTenantBootstrapStore(pool), {
-    shopDomain: session.shop,
-    accessToken: session.accessToken,
-    scopes: session.scope ?? "",
-  });
-
-  const ctx = await getTenantContextByShopDomain(pool, session.shop);
-  const demoOrder = buildDemoShopifyOrderPayload(session.shop);
-
-  if (intent === "import-shopify-order") {
-    const shopifyOrderId = formString(formData, "shopifyOrderId");
-
-    if (!shopifyOrderId) {
-      return {
-        ok: false,
-        message: "Select a Shopify order before importing.",
-      } satisfies ActionResult;
-    }
-
-    const shopifyOrder = await fetchShopifyOrderById(admin, shopifyOrderId);
-    const result = await importShopifyOrderWithSupplyCheck(
-      pool,
-      ctx,
-      session.shop,
-      shopifyOrder,
-    );
-
-    return {
-      ok: true,
-      message: result.importResult.alreadyImported
-        ? `Shopify order ${shopifyOrder.name} is already in Operations Ledger. Supply check is up to date: ${result.supplyCheck.status}.`
-        : `Imported ${shopifyOrder.name} and ran supply check: ${result.supplyCheck.status}.`,
-    } satisfies ActionResult;
-  }
-
-  if (intent === "create-demo-operational-cases") {
-    const result = await createDemoOperationalCases(pool, ctx);
-
-    return {
-      ok: true,
-      message: `Demo operational cases are ready (${result.operationCaseIds.length}).`,
+        "Operations Ledger database is not configured. Set OPERATIONS_LEDGER_DATABASE_URL and restart the app.",
     } satisfies ActionResult;
   }
 
   if (intent === "create-demo-kit-items") {
-    const result = await createDemoKitItems(pool, ctx);
+    const result = await createDemoKitItems(context.pool, context.ctx);
 
     return {
       ok: true,
-      message: `Demo kit item setup is ready (${result.count} items).`,
+      message: `Demo items are ready (${result.count} items).`,
     } satisfies ActionResult;
   }
 
   if (intent === "create-demo-kit-bom") {
-    await createDemoKitBom(pool, ctx);
+    await createDemoKitBom(context.pool, context.ctx);
 
     return {
       ok: true,
-      message:
-        "Demo Kit BOM is ready: 1 x BOX, 2 x COMPONENT-A, 1 x MANUAL.",
-    } satisfies ActionResult;
-  }
-
-  if (intent === "update-item-settings") {
-    const itemId = formString(formData, "itemId");
-    const itemType = formString(formData, "itemType");
-    const unit = formString(formData, "unit") ?? "pcs";
-
-    if (!itemId || !itemType || !itemTypes.includes(itemType as ItemType)) {
-      return {
-        ok: false,
-        message: "Select a valid item and item type before saving.",
-      } satisfies ActionResult;
-    }
-
-    await updateItemClassification(pool, ctx, {
-      itemId,
-      itemType: itemType as ItemType,
-      unit,
-      isSellable: formData.get("isSellable") === "on",
-      isPurchasable: formData.get("isPurchasable") === "on",
-      isProducible: formData.get("isProducible") === "on",
-    });
-
-    return {
-      ok: true,
-      message: "Item classification updated.",
+      message: "Demo Kit BOM is ready.",
     } satisfies ActionResult;
   }
 
   if (intent === "run-mrp-preview") {
-    const preview = await runDemoKitMrpPreview(pool, ctx, 1);
+    const preview = await runDemoKitMrpPreview(context.pool, context.ctx, 1);
 
     return {
       ok: Boolean(preview),
       message: preview
-        ? "MRP preview saved for 1 Demo Kit. No purchase or production needs were created."
-        : "Create Demo Kit Items and Demo Kit BOM before previewing MRP.",
+        ? "MRP Preview saved for 1 Demo Kit."
+        : "Create demo items and BOM before running MRP Preview.",
     } satisfies ActionResult;
   }
 
@@ -310,1107 +123,196 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       } satisfies ActionResult;
     }
 
-    const commitResult = await commitMrpRunNeeds(pool, ctx, { mrpRunId });
-    const createdPurchaseNeeds = commitResult.purchaseNeeds.filter(
-      (need) => !need.alreadyCommitted,
-    ).length;
-    const createdProductionNeeds = commitResult.productionNeeds.filter(
-      (need) => !need.alreadyCommitted,
-    ).length;
-    const alreadyCommitted =
-      commitResult.purchaseNeeds.filter((need) => need.alreadyCommitted)
-        .length +
-      commitResult.productionNeeds.filter((need) => need.alreadyCommitted)
-        .length;
-
-    return {
-      ok: true,
-      message: `Committed MRP needs. Created ${createdPurchaseNeeds} purchase need(s), ${createdProductionNeeds} production need(s). ${alreadyCommitted} need(s) were already committed.`,
-      commitResult,
-    } satisfies ActionResult;
-  }
-
-  if (intent === "run-demo-kit-supply-check") {
-    await createDemoKitBom(pool, ctx);
-
-    const demoKitOrder = {
-      shopDomain: session.shop,
-      shopifyOrderId: `demo-mrp-kit-order:${session.shop.toLowerCase()}`,
-      shopifyOrderName: "DEV-MRP-1001",
-      customerName: "Development Customer",
-      customerExternalId: "demo-customer",
-      currency: "EUR",
-      rawPayload: {
-        source: "operations-ledger-mrp-dev-action",
-        shopDomain: session.shop,
-      },
-      lines: [
-        {
-          shopifyVariantId: "demo-variant:demo-kit",
-          sku: "DEMO-KIT",
-          title: "Demo Kit",
-          quantity: 1,
-        },
-      ],
-    };
-    const imported = await importShopifyOrder(pool, demoKitOrder);
-    const result = await runSupplyCheck(pool, ctx, imported.operationsOrderId);
-
-    return {
-      ok: true,
-      message: `Demo Kit Supply Check completed: ${result.status}. Production needs: ${result.createdProductionNeeds.length}; purchase needs: ${result.createdPurchaseNeeds.length}.`,
-    } satisfies ActionResult;
-  }
-
-  if (intent === "create-demo-order") {
-    const result = await importShopifyOrder(pool, demoOrder);
-
-    return {
-      ok: true,
-      message: result.alreadyImported
-        ? "Demo Operations Order already exists."
-        : "Demo Operations Order created.",
-    } satisfies ActionResult;
-  }
-
-  if (intent === "run-demo-supply-check") {
-    const imported = await importShopifyOrder(pool, demoOrder);
-    const result = await runSupplyCheck(pool, ctx, imported.operationsOrderId);
-
-    return {
-      ok: true,
-      message: `Demo Supply Check completed: ${result.status}.`,
-    } satisfies ActionResult;
-  }
-
-  if (intent === "create-demo-purchase-order") {
-    const purchaseNeedId = formString(formData, "purchaseNeedId");
-
-    if (!purchaseNeedId) {
-      return {
-        ok: false,
-        message: "Select a purchase need before creating a demo Purchase Order.",
-      } satisfies ActionResult;
-    }
-
-    const supplier = await createSupplier(pool, ctx, {
-      name: "Development Demo Supplier",
-      email: "supplier@example.com",
-      externalRef: "development-demo-supplier",
-    });
-    const purchaseOrder = await createPurchaseOrderFromNeeds(pool, ctx, {
-      supplierId: supplier.supplierId,
-      purchaseNeedIds: [purchaseNeedId],
-      currency: demoOrder.currency,
-      notes: "Created by Operations Ledger development dashboard action.",
-      idempotencyKey: `demo:create_purchase_order:${purchaseNeedId}`,
+    const result = await commitMrpRunNeeds(context.pool, context.ctx, {
+      mrpRunId,
     });
 
     return {
       ok: true,
-      message: purchaseOrder.alreadyCreated
-        ? "Purchase order already exists for this need."
-        : "Demo Purchase Order created.",
-    } satisfies ActionResult;
-  }
-
-  if (intent === "send-demo-purchase-order") {
-    const purchaseOrderId = formString(formData, "purchaseOrderId");
-
-    if (!purchaseOrderId) {
-      return {
-        ok: false,
-        message: "Select a Purchase Order before sending.",
-      } satisfies ActionResult;
-    }
-
-    const result = await sendPurchaseOrder(pool, ctx, purchaseOrderId);
-
-    return {
-      ok: true,
-      message: result.alreadySent
-        ? "Purchase order was already sent."
-        : "Demo Purchase Order sent.",
-    } satisfies ActionResult;
-  }
-
-  if (intent === "post-demo-goods-receipt") {
-    const purchaseOrderId = formString(formData, "purchaseOrderId");
-
-    if (!purchaseOrderId) {
-      return {
-        ok: false,
-        message: "Select a Purchase Order before posting goods receipt.",
-      } satisfies ActionResult;
-    }
-
-    const lines = await getRemainingReceiptLines(
-      pool,
-      ctx.tenantId,
-      purchaseOrderId,
-    );
-
-    if (lines.length === 0) {
-      return {
-        ok: false,
-        message: "No remaining Purchase Order quantity is available to receive.",
-      } satisfies ActionResult;
-    }
-
-    const result = await postGoodsReceipt(pool, ctx, {
-      purchaseOrderId,
-      notes: "Posted by Operations Ledger development dashboard action.",
-      idempotencyKey: `demo:post_goods_receipt:${purchaseOrderId}`,
-      lines,
-    });
-
-    return {
-      ok: true,
-      message: result.alreadyPosted
-        ? "Goods receipt already posted."
-        : `Demo Goods Receipt posted: ${result.purchaseOrderStatus}.`,
+      message: `Committed needs: ${result.purchaseNeeds.length} purchase, ${result.productionNeeds.length} production.`,
     } satisfies ActionResult;
   }
 
   return {
     ok: false,
-    message: "Unknown Operations Ledger action.",
+    message: "Unknown dashboard action.",
   } satisfies ActionResult;
 };
 
-function formatQuantity(value: number) {
-  return new Intl.NumberFormat("en", {
-    maximumFractionDigits: 4,
-  }).format(value);
-}
-
-function remainingNeedQuantity(input: {
-  quantityNeeded: number;
-  quantityCovered: number;
-}) {
-  return Math.max(input.quantityNeeded - input.quantityCovered, 0);
-}
-
-function formatCaseType(caseType: string) {
-  return caseType
-    .split("_")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function shortReference(value: string | null) {
-  if (!value) {
-    return "Not linked";
-  }
-
-  return value.length > 32 ? `...${value.slice(-18)}` : value;
-}
-
-function formatAction(action: MrpPreviewLine["action"]) {
-  return action
-    .split("_")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function EmptyState({ children }: { children: string }) {
-  return <s-paragraph>{children}</s-paragraph>;
-}
-
-export default function Index() {
+export default function Dashboard() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const isSubmitting = navigation.state !== "idle";
-  const pendingShopifyOrderCount = data.shopifyOrders.filter(
-    (order) => !order.imported && order.lines.length > 0,
-  ).length;
-  const nextAction = getDashboardNextAction(data.dashboard, {
-    pendingShopifyOrderCount,
-  });
-  const openCases = data.operationCases.filter((operationCase) =>
-    ["open", "in_progress"].includes(operationCase.status),
-  );
-  const blockedCases = data.operationCases.filter(
-    (operationCase) => operationCase.status === "blocked",
-  );
-  const decisionCases = data.operationCases.filter(
-    (operationCase) =>
-      operationCase.status === "waiting_for_decision" ||
-      operationCase.pendingDecisionCount > 0,
-  );
-  const openTaskCount = data.operationCases.reduce(
-    (sum, operationCase) => sum + operationCase.openTaskCount,
-    0,
-  );
-  const hasDemoKitItems = data.materialItems.some(
-    (item) => item.sku === "DEMO-KIT",
-  );
-  const hasDemoKitBom = data.boms.some((bom) => bom.parentSku === "DEMO-KIT");
-  const materialsNextAction = !hasDemoKitItems
-    ? "Configure item classification by creating the demo kit items."
-    : !hasDemoKitBom
-      ? "Create the Demo Kit BOM so MRP can explode component demand."
-      : "Run MRP preview to see shortages and recommended buy/make actions before committing any needs.";
-  const activeFlowStage = dashboardFlowStages.findIndex((stage) =>
-    nextAction.stage === "ORDER"
-      ? stage === "Order"
-      : nextAction.stage === "SUPPLY_CHECK"
-        ? stage === "Supply Check"
-        : nextAction.stage === "PURCHASE_NEED"
-          ? stage === "Purchase Need"
-          : nextAction.stage === "PURCHASE_ORDER"
-            ? stage === "Purchase Order"
-            : nextAction.stage === "GOODS_RECEIPT"
-              ? stage === "Goods Receipt"
-              : stage === "Inventory Updated",
-  );
 
   return (
     <s-page heading="Operations Ledger">
-      <s-section heading="Tenant status">
+      <s-section heading="Operational cockpit">
         <s-stack direction="block" gap="base">
           <s-paragraph>
-            <s-text>Shop: </s-text>
-            <s-text>{data.shopDomain}</s-text>
+            Operations Ledger turns Shopify demand into operational work:
+            classified materials, BOMs, MRP previews, and committed purchase or
+            production needs.
           </s-paragraph>
-          <s-paragraph>
-            <s-text>Operations database: </s-text>
-            <s-text>
-              {data.configured ? "Connected" : "Not configured for this run"}
-            </s-text>
-          </s-paragraph>
-          {data.dashboard && (
-            <s-paragraph>
-              <s-text>Tenant: </s-text>
-              <s-text>{data.dashboard.tenant.status}</s-text>
-            </s-paragraph>
-          )}
           {!data.configured && (
-            <s-paragraph>
-              Set <code>OPERATIONS_LEDGER_DATABASE_URL</code> and{" "}
-              <code>OPERATIONS_LEDGER_TOKEN_ENCRYPTION_KEY</code>, then restart{" "}
-              <code>npm run dev</code>.
-            </s-paragraph>
-          )}
-          {actionData && (
-            <s-box
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
-              background="subdued"
-            >
-              <s-paragraph>{actionData.message}</s-paragraph>
-              {actionData.ok && actionData.commitResult && (
-                <s-stack direction="block" gap="small">
-                  <s-paragraph>
-                    Purchase needs:{" "}
-                    {actionData.commitResult.purchaseNeeds.length}
-                  </s-paragraph>
-                  {actionData.commitResult.purchaseNeeds.map((need) => (
-                    <s-paragraph key={`purchase-${need.id}`}>
-                      <s-text>{need.sku ?? need.id}</s-text>
-                      <s-text> · qty {formatQuantity(need.quantity)}</s-text>
-                      <s-text> · {need.status}</s-text>
-                      <s-text>
-                        {" "}
-                        ·{" "}
-                        {need.alreadyCommitted
-                          ? "Already committed"
-                          : "Created"}
-                      </s-text>
-                    </s-paragraph>
-                  ))}
-                  <s-paragraph>
-                    Production needs:{" "}
-                    {actionData.commitResult.productionNeeds.length}
-                  </s-paragraph>
-                  {actionData.commitResult.productionNeeds.map((need) => (
-                    <s-paragraph key={`production-${need.id}`}>
-                      <s-text>{need.sku ?? need.id}</s-text>
-                      <s-text> · qty {formatQuantity(need.quantity)}</s-text>
-                      <s-text> · {need.status}</s-text>
-                      <s-text>
-                        {" "}
-                        ·{" "}
-                        {need.alreadyCommitted
-                          ? "Already committed"
-                          : "Created"}
-                      </s-text>
-                    </s-paragraph>
-                  ))}
-                  {actionData.commitResult.skippedLines.length > 0 && (
-                    <s-paragraph>
-                      Skipped lines:{" "}
-                      {actionData.commitResult.skippedLines
-                        .map(
-                          (line) =>
-                            `${line.sku ?? line.mrpRunLineId} (${line.reason})`,
-                        )
-                        .join(", ")}
-                    </s-paragraph>
-                  )}
-                </s-stack>
-              )}
-            </s-box>
-          )}
-        </s-stack>
-      </s-section>
-
-      <s-section heading="Next action">
-        <s-stack direction="block" gap="base">
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>{nextAction.message}</s-heading>
-          </s-box>
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>{materialsNextAction}</s-heading>
-            <s-paragraph>
-              Shopify owns products, variants, orders, and inventory records.
-              Operations Ledger adds item classification, BOMs, and MRP work.
-            </s-paragraph>
-          </s-box>
-          <s-stack direction="inline" gap="small">
-            {dashboardFlowStages.map((stage, index) => (
-              <s-box
-                key={stage}
-                padding="small"
-                borderWidth="base"
-                borderRadius="base"
-                {...(index === activeFlowStage ? { background: "subdued" } : {})}
-              >
-                <s-paragraph>
-                  <s-text>{index < activeFlowStage ? "Done: " : ""}</s-text>
-                  <s-text>{stage}</s-text>
-                </s-paragraph>
-              </s-box>
-            ))}
-          </s-stack>
-        </s-stack>
-      </s-section>
-
-      <s-section heading="Operational work">
-        <s-stack direction="block" gap="base">
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>Open work</s-heading>
-            {openCases.length ? (
-              <s-stack direction="block" gap="small">
-                {openCases.slice(0, 5).map((operationCase) => (
-                  <s-paragraph key={operationCase.id}>
-                    <s-link href={`/app/cases/${operationCase.id}`}>
-                      {operationCase.summary}
-                    </s-link>
-                    <s-text> · {formatCaseType(operationCase.caseType)}</s-text>
-                    <s-text> · {operationCase.priority}</s-text>
-                    {operationCase.assignedRoleName && (
-                      <s-text> · {operationCase.assignedRoleName}</s-text>
-                    )}
-                  </s-paragraph>
-                ))}
-              </s-stack>
-            ) : (
-              <EmptyState>No open cases yet.</EmptyState>
-            )}
-          </s-box>
-
-          <s-stack direction="inline" gap="base">
             <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{openTaskCount}</s-heading>
-              <s-paragraph>My tasks placeholder</s-paragraph>
-            </s-box>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{blockedCases.length}</s-heading>
-              <s-paragraph>Blocked cases</s-paragraph>
-            </s-box>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>{decisionCases.length}</s-heading>
-              <s-paragraph>Needs decision</s-paragraph>
-            </s-box>
-          </s-stack>
-
-          {blockedCases.length > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>Blocked cases</s-heading>
-              {blockedCases.slice(0, 3).map((operationCase) => (
-                <s-paragraph key={operationCase.id}>
-                  <s-link href={`/app/cases/${operationCase.id}`}>
-                    {operationCase.summary}
-                  </s-link>
-                  <s-text>
-                    {" "}
-                    · {operationCase.blockedReason ?? "Blocked"}
-                  </s-text>
-                </s-paragraph>
-              ))}
-            </s-box>
-          )}
-
-          {decisionCases.length > 0 && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-heading>Needs decision</s-heading>
-              {decisionCases.slice(0, 3).map((operationCase) => (
-                <s-paragraph key={operationCase.id}>
-                  <s-link href={`/app/cases/${operationCase.id}`}>
-                    {operationCase.summary}
-                  </s-link>
-                  <s-text>
-                    {" "}
-                    · {operationCase.pendingDecisionCount} pending
-                  </s-text>
-                </s-paragraph>
-              ))}
-            </s-box>
-          )}
-
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>Recent ledger activity</s-heading>
-            {data.recentCaseEvents.length ? (
-              data.recentCaseEvents.map((event) => (
-                <s-paragraph key={event.id}>
-                  <s-link href={`/app/cases/${event.operationCaseId}`}>
-                    {event.caseSummary}
-                  </s-link>
-                  <s-text> · {event.title}</s-text>
-                  {event.message && <s-text> · {event.message}</s-text>}
-                </s-paragraph>
-              ))
-            ) : (
-              <EmptyState>No case ledger activity yet.</EmptyState>
-            )}
-          </s-box>
-        </s-stack>
-      </s-section>
-
-      <s-section heading="Shopify Orders">
-        <s-stack direction="block" gap="base">
-          {data.shopifyOrdersError && (
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-paragraph>{data.shopifyOrdersError}</s-paragraph>
               <s-paragraph>
-                Confirm the app has the <code>read_orders</code> scope, then
-                reopen the Shopify preview.
+                Database connection is not configured for this app run.
               </s-paragraph>
             </s-box>
           )}
-          {!data.shopifyOrdersError && data.shopifyOrders.length === 0 && (
-            <EmptyState>No recent Shopify Orders found.</EmptyState>
-          )}
-          {data.shopifyOrders.map((order) => (
-            <s-box
-              key={order.id}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
-            >
-              <s-stack direction="block" gap="small">
-                <s-paragraph>
-                  <s-text>{order.name}</s-text>
-                  <s-text>
-                    {" "}
-                    · {order.imported
-                      ? `Imported (${order.operationsOrderStatus})`
-                      : "Ready to import"}
-                  </s-text>
-                </s-paragraph>
-                <s-paragraph>
-                  <s-text>
-                    {order.lines.length} line
-                    {order.lines.length === 1 ? "" : "s"}
-                  </s-text>
-                  {order.lines[0] && (
-                    <s-text>
-                      {" "}
-                      · {order.lines[0].sku ?? order.lines[0].title} · qty{" "}
-                      {formatQuantity(order.lines[0].quantity)}
-                    </s-text>
-                  )}
-                </s-paragraph>
-                {!order.imported && order.lines.length > 0 && (
-                  <Form method="post">
-                    <input
-                      type="hidden"
-                      name="intent"
-                      value="import-shopify-order"
-                    />
-                    <input
-                      type="hidden"
-                      name="shopifyOrderId"
-                      value={order.id}
-                    />
-                    <s-button
-                      type="submit"
-                      {...(isSubmitting ? { loading: true } : {})}
-                      disabled={!data.configured}
-                    >
-                      Import Order into Operations Ledger
-                    </s-button>
-                  </Form>
-                )}
-                {!order.imported && order.lines.length === 0 && (
-                  <s-paragraph>No line items available to import.</s-paragraph>
-                )}
-              </s-stack>
+          {actionData && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>{actionData.message}</s-paragraph>
             </s-box>
-          ))}
+          )}
+          <s-stack direction="inline" gap="base">
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{data.itemCount}</s-heading>
+              <s-paragraph>Total items</s-paragraph>
+            </s-box>
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{data.activeBomCount}</s-heading>
+              <s-paragraph>Active BOMs</s-paragraph>
+            </s-box>
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>
+                {data.latestMrpRun
+                  ? formatStatus(data.latestMrpRun.status)
+                  : "None"}
+              </s-heading>
+              <s-paragraph>Latest MRP run</s-paragraph>
+            </s-box>
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{data.openPurchaseNeedCount}</s-heading>
+              <s-paragraph>Open purchase needs</s-paragraph>
+            </s-box>
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-heading>{data.openProductionNeedCount}</s-heading>
+              <s-paragraph>Open production needs</s-paragraph>
+            </s-box>
+          </s-stack>
         </s-stack>
       </s-section>
 
-      <s-section heading="Demo fallback actions">
-        <s-stack direction="inline" gap="base">
-          <Form method="post">
-            <input
-              type="hidden"
-              name="intent"
-              value="create-demo-operational-cases"
-            />
-            <s-button
-              type="submit"
-              variant="secondary"
-              {...(isSubmitting ? { loading: true } : {})}
-              disabled={!data.configured}
-            >
-              Demo: Create Operational Cases
-            </s-button>
-          </Form>
-          <Form method="post">
-            <input type="hidden" name="intent" value="create-demo-order" />
-            <s-button
-              type="submit"
-              variant="secondary"
-              {...(isSubmitting ? { loading: true } : {})}
-              disabled={!data.configured}
-            >
-              Demo: Create Operations Order
-            </s-button>
-          </Form>
-          <Form method="post">
-            <input type="hidden" name="intent" value="run-demo-supply-check" />
-            <s-button
-              type="submit"
-              variant="secondary"
-              {...(isSubmitting ? { loading: true } : {})}
-              disabled={!data.configured}
-            >
-              Demo: Run Supply Check
-            </s-button>
-          </Form>
-          <Form method="post">
-            <input type="hidden" name="intent" value="create-demo-kit-items" />
-            <s-button
-              type="submit"
-              variant="secondary"
-              {...(isSubmitting ? { loading: true } : {})}
-              disabled={!data.configured}
-            >
-              Demo: Create Demo Kit Items
-            </s-button>
-          </Form>
-          <Form method="post">
-            <input type="hidden" name="intent" value="create-demo-kit-bom" />
-            <s-button
-              type="submit"
-              variant="secondary"
-              {...(isSubmitting ? { loading: true } : {})}
-              disabled={!data.configured}
-            >
-              Demo: Create Demo Kit BOM
-            </s-button>
-          </Form>
-        </s-stack>
-      </s-section>
-
-      <s-section heading="Items / Materials">
+      <s-section heading="Guided demo flow">
         <s-stack direction="block" gap="base">
           <s-paragraph>
-            Shopify variants stay the commerce source of record. Operations
-            Ledger only classifies those variants for material planning.
+            Use this path to test the implemented spine without leaving the
+            Shopify app.
           </s-paragraph>
-          {!data.materialItems.length && (
-            <EmptyState>
-              No operational item classifications yet. Create demo kit items or
-              import an order.
-            </EmptyState>
-          )}
-          {data.materialItems.map((item) => (
-            <s-box
-              key={item.id}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
-            >
-              <s-stack direction="block" gap="small">
-                <s-paragraph>
-                  <s-text>{item.sku ?? "No SKU"}</s-text>
-                  <s-text> · {shortReference(item.shopifyVariantId)}</s-text>
-                </s-paragraph>
-                <s-paragraph>
-                  <s-text>{item.itemType}</s-text>
-                  <s-text> · unit {item.unit}</s-text>
-                  <s-text>
-                    {" "}
-                    · {item.isSellable ? "Sellable" : "Not sellable"}
-                  </s-text>
-                  <s-text>
-                    {" "}
-                    · {item.isPurchasable ? "Purchasable" : "Not purchasable"}
-                  </s-text>
-                  <s-text>
-                    {" "}
-                    · {item.isProducible ? "Producible" : "Not producible"}
-                  </s-text>
-                </s-paragraph>
-                <Form method="post">
-                  <input
-                    type="hidden"
-                    name="intent"
-                    value="update-item-settings"
-                  />
-                  <input type="hidden" name="itemId" value={item.id} />
-                  <s-stack direction="inline" gap="small">
-                    <label>
-                      Type{" "}
-                      <select name="itemType" defaultValue={item.itemType}>
-                        {itemTypes.map((itemType) => (
-                          <option key={itemType} value={itemType}>
-                            {itemType}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      Unit{" "}
-                      <input
-                        name="unit"
-                        defaultValue={item.unit}
-                        size={6}
-                        aria-label={`${item.sku ?? item.id} unit`}
-                      />
-                    </label>
-                    <label>
-                      <input
-                        type="checkbox"
-                        name="isSellable"
-                        defaultChecked={item.isSellable}
-                      />{" "}
-                      Sellable
-                    </label>
-                    <label>
-                      <input
-                        type="checkbox"
-                        name="isPurchasable"
-                        defaultChecked={item.isPurchasable}
-                      />{" "}
-                      Purchasable
-                    </label>
-                    <label>
-                      <input
-                        type="checkbox"
-                        name="isProducible"
-                        defaultChecked={item.isProducible}
-                      />{" "}
-                      Producible
-                    </label>
-                    <s-button
-                      type="submit"
-                      variant="secondary"
-                      {...(isSubmitting ? { loading: true } : {})}
-                    >
-                      Save
-                    </s-button>
-                  </s-stack>
-                </Form>
-              </s-stack>
-            </s-box>
-          ))}
-        </s-stack>
-      </s-section>
-
-      <s-section heading="BOMs">
-        <s-stack direction="block" gap="base">
-          {!data.boms.length && (
-            <EmptyState>
-              No BOMs yet. Create the Demo Kit BOM to see component demand.
-            </EmptyState>
-          )}
-          {data.boms.map((bom) => (
-            <s-box
-              key={bom.id}
-              padding="base"
-              borderWidth="base"
-              borderRadius="base"
-            >
-              <s-stack direction="block" gap="small">
-                <s-paragraph>
-                  <s-text>{bom.parentSku ?? bom.parentVariantId}</s-text>
-                  <s-text> · version {bom.version}</s-text>
-                  <s-text> · {bom.isActive ? "Active" : "Inactive"}</s-text>
-                </s-paragraph>
-                {bom.lines.map((line) => (
-                  <s-paragraph key={line.id}>
-                    <s-text>
-                      {formatQuantity(line.quantity)} x{" "}
-                      {line.componentSku ?? line.componentVariantId}
-                    </s-text>
-                    <s-text> · {line.unit}</s-text>
-                    <s-text> · {line.componentItemType}</s-text>
-                  </s-paragraph>
-                ))}
-              </s-stack>
-            </s-box>
-          ))}
-        </s-stack>
-      </s-section>
-
-      <s-section heading="MRP Preview">
-        <s-stack direction="block" gap="base">
-          <Form method="post">
-            <input type="hidden" name="intent" value="run-mrp-preview" />
-            <s-button
-              type="submit"
-              variant="secondary"
-              {...(isSubmitting ? { loading: true } : {})}
-              disabled={!data.configured}
-            >
-              Run MRP Preview
-            </s-button>
-          </Form>
-          {!data.demoKitMrpPreview && (
-            <EmptyState>
-              Demo Kit MRP preview is waiting for demo kit items, BOM, and a
-              preview run.
-            </EmptyState>
-          )}
-          {data.demoKitMrpPreview && (
+          <s-stack direction="inline" gap="base">
+            <Form method="post">
+              <input
+                type="hidden"
+                name="intent"
+                value="create-demo-kit-items"
+              />
+              <s-button
+                type="submit"
+                variant={data.hasDemoItems ? "secondary" : "primary"}
+                disabled={!data.configured}
+                {...(isSubmitting ? { loading: true } : {})}
+              >
+                Step 1: Create Demo Items
+              </s-button>
+            </Form>
+            <Form method="post">
+              <input type="hidden" name="intent" value="create-demo-kit-bom" />
+              <s-button
+                type="submit"
+                variant={data.hasDemoBom ? "secondary" : "primary"}
+                disabled={!data.configured}
+                {...(isSubmitting ? { loading: true } : {})}
+              >
+                Step 2: Create Demo BOM
+              </s-button>
+            </Form>
+            <Form method="post">
+              <input type="hidden" name="intent" value="run-mrp-preview" />
+              <s-button
+                type="submit"
+                variant="primary"
+                disabled={!data.configured || !data.hasDemoBom}
+                {...(isSubmitting ? { loading: true } : {})}
+              >
+                Step 3: Run MRP Preview
+              </s-button>
+            </Form>
+            <Form method="post">
+              <input type="hidden" name="intent" value="commit-mrp-needs" />
+              <input
+                type="hidden"
+                name="mrpRunId"
+                value={data.demoPreview?.mrpRunId ?? ""}
+              />
+              <s-button
+                type="submit"
+                variant="primary"
+                disabled={!data.configured || !data.demoPreview?.mrpRunId}
+                {...(isSubmitting ? { loading: true } : {})}
+              >
+                Step 4: Commit Needs
+              </s-button>
+            </Form>
+            <s-link href="/app/needs">Step 5: Review Needs</s-link>
+          </s-stack>
+          {data.demoPreview ? (
             <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-stack direction="block" gap="small">
-                <s-heading>1 x DEMO-KIT</s-heading>
-                {data.demoKitMrpPreview.mrpRunId && (
-                  <s-paragraph>
-                    <s-text>
-                      Preview run {shortReference(data.demoKitMrpPreview.mrpRunId)}
-                    </s-text>
-                    <s-text> · {data.demoKitMrpPreview.status}</s-text>
-                  </s-paragraph>
-                )}
-                <s-paragraph>
-                  <s-text>
-                    Finished item shortage:{" "}
-                    {formatQuantity(
-                      data.demoKitMrpPreview.parent.shortageQuantity,
-                    )}
-                  </s-text>
-                  <s-text>
-                    {" "}
-                    · {formatAction(data.demoKitMrpPreview.parent.action)}
-                  </s-text>
-                </s-paragraph>
-                {data.demoKitMrpPreview.components.map((line) => (
-                  <s-paragraph key={line.itemId}>
-                    <s-text>{line.sku ?? line.itemId}</s-text>
-                    <s-text>
-                      {" "}
-                      · required {formatQuantity(line.requiredQuantity)}
-                    </s-text>
-                    <s-text>
-                      {" "}
-                      · available {formatQuantity(line.availableQuantity)}
-                    </s-text>
-                    <s-text>
-                      {" "}
-                      · shortage {formatQuantity(line.shortageQuantity)}
-                    </s-text>
-                    <s-text> · {formatAction(line.action)}</s-text>
-                    {line.explanation && (
-                      <s-text> · {line.explanation}</s-text>
-                    )}
-                  </s-paragraph>
-                ))}
-                <s-paragraph>
-                  MRP Preview only writes mrp_runs and mrp_run_lines. It does
-                  not create purchase needs or production needs.
-                </s-paragraph>
-                {data.demoKitMrpPreview.mrpRunId && (
-                  <Form method="post">
-                    <input
-                      type="hidden"
-                      name="intent"
-                      value="commit-mrp-needs"
-                    />
-                    <input
-                      type="hidden"
-                      name="mrpRunId"
-                      value={data.demoKitMrpPreview.mrpRunId}
-                    />
-                    <s-button
-                      type="submit"
-                      variant="primary"
-                      {...(isSubmitting ? { loading: true } : {})}
-                      disabled={!data.configured}
-                    >
-                      Commit Needs from Preview
-                    </s-button>
-                  </Form>
-                )}
-              </s-stack>
+              <s-paragraph>
+                Latest preview {shortReference(data.demoPreview.mrpRunId)} ·{" "}
+                {formatStatus(data.demoPreview.status)}
+              </s-paragraph>
+              <s-paragraph>
+                Demo Kit shortage:{" "}
+                {formatQuantity(data.demoPreview.parent.shortageQuantity)}
+              </s-paragraph>
             </s-box>
+          ) : (
+            <PlanningEmptyState>
+              No MRP Preview has been run for the Demo Kit yet.
+            </PlanningEmptyState>
           )}
         </s-stack>
       </s-section>
 
-      <s-section heading="Counts">
-        <s-stack direction="inline" gap="base">
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>
-              {data.dashboard?.counts.operationsOrders ?? 0}
-            </s-heading>
-            <s-paragraph>Operations Orders</s-paragraph>
-          </s-box>
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>{data.dashboard?.counts.purchaseNeeds ?? 0}</s-heading>
-            <s-paragraph>Purchase Needs</s-paragraph>
-          </s-box>
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>{data.dashboard?.counts.purchaseOrders ?? 0}</s-heading>
-            <s-paragraph>Purchase Orders</s-paragraph>
-          </s-box>
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>{data.dashboard?.counts.goodsReceipts ?? 0}</s-heading>
-            <s-paragraph>Goods Receipts</s-paragraph>
-          </s-box>
-          <s-box padding="base" borderWidth="base" borderRadius="base">
-            <s-heading>
-              {data.dashboard?.counts.inventoryMovements ?? 0}
-            </s-heading>
-            <s-paragraph>Inventory Movements</s-paragraph>
-          </s-box>
+      <s-section heading="Next work">
+        <s-stack direction="block" gap="base">
+          {!data.hasDemoItems && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                Missing item classifications. Start with Demo Items or import
+                Shopify variants.
+              </s-paragraph>
+            </s-box>
+          )}
+          {data.hasDemoItems && !data.hasDemoBom && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                Demo Kit exists but has no BOM. Create the BOM before running
+                MRP.
+              </s-paragraph>
+            </s-box>
+          )}
+          {data.openPurchaseNeedCount > 0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                {data.openPurchaseNeedCount} purchase need
+                {data.openPurchaseNeedCount === 1 ? "" : "s"} waiting.
+              </s-paragraph>
+              <s-link href="/app/needs">Open Needs</s-link>
+            </s-box>
+          )}
+          {data.openProductionNeedCount > 0 && (
+            <s-box padding="base" borderWidth="base" borderRadius="base">
+              <s-paragraph>
+                {data.openProductionNeedCount} production need
+                {data.openProductionNeedCount === 1 ? "" : "s"} waiting.
+              </s-paragraph>
+              <s-link href="/app/needs">Open Needs</s-link>
+            </s-box>
+          )}
         </s-stack>
-      </s-section>
-
-      <s-section heading="Operations Orders">
-        {data.dashboard?.operationsOrders.length ? (
-          <s-stack direction="block" gap="base">
-            {data.dashboard.operationsOrders.map((order) => (
-              <s-box
-                key={order.id}
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-              >
-                <s-paragraph>
-                  <s-text>{order.orderNumber ?? order.id}</s-text>
-                  <s-text> · {order.status}</s-text>
-                  <s-text> · {order.originType}</s-text>
-                </s-paragraph>
-              </s-box>
-            ))}
-          </s-stack>
-        ) : (
-          <EmptyState>No Operations Orders yet.</EmptyState>
-        )}
-      </s-section>
-
-      <s-section heading="Purchase Needs">
-        {data.dashboard?.purchaseNeeds.length ? (
-          <s-stack direction="block" gap="base">
-            {data.dashboard.purchaseNeeds.map((need) => (
-              <s-box
-                key={need.id}
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-              >
-                <s-paragraph>
-                  <s-text>{need.sku ?? need.title}</s-text>
-                  <s-text> · {need.status}</s-text>
-                </s-paragraph>
-                <s-paragraph>
-                  <s-text>Required: {formatQuantity(need.quantityRequired)}</s-text>
-                  <s-text>
-                    {" "}
-                    · Reserved/available: {formatQuantity(need.quantityReserved)}
-                  </s-text>
-                  <s-text>
-                    {" "}
-                    · Missing: {formatQuantity(remainingNeedQuantity(need))}
-                  </s-text>
-                </s-paragraph>
-                <s-paragraph>
-                  <s-text>
-                    Supplier: {need.supplierName ?? "Development Demo Supplier"}
-                  </s-text>
-                  {need.operationsOrderNumber && (
-                    <s-text> · Order {need.operationsOrderNumber}</s-text>
-                  )}
-                </s-paragraph>
-                {need.status === "OPEN" && (
-                  <Form method="post">
-                    <input
-                      type="hidden"
-                      name="intent"
-                      value="create-demo-purchase-order"
-                    />
-                    <input
-                      type="hidden"
-                      name="purchaseNeedId"
-                      value={need.id}
-                    />
-                    <s-button
-                      type="submit"
-                      variant="secondary"
-                      {...(isSubmitting ? { loading: true } : {})}
-                    >
-                      Demo: Create Purchase Order
-                    </s-button>
-                  </Form>
-                )}
-              </s-box>
-            ))}
-          </s-stack>
-        ) : (
-          <EmptyState>No Purchase Needs yet.</EmptyState>
-        )}
-      </s-section>
-
-      <s-section heading="Purchase Orders">
-        {data.dashboard?.purchaseOrders.length ? (
-          <s-stack direction="block" gap="base">
-            {data.dashboard.purchaseOrders.map((purchaseOrder) => (
-              <s-box
-                key={purchaseOrder.id}
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-              >
-                <s-stack direction="block" gap="small">
-                  <s-paragraph>
-                    <s-text>{purchaseOrder.poNumber ?? purchaseOrder.id}</s-text>
-                    <s-text> · {purchaseOrder.status}</s-text>
-                    <s-text> · {purchaseOrder.supplierName}</s-text>
-                    {purchaseOrder.currency && (
-                      <s-text> · {purchaseOrder.currency}</s-text>
-                    )}
-                  </s-paragraph>
-                  <s-paragraph>
-                    <s-text>
-                      Related need:{" "}
-                      {purchaseOrder.relatedNeedTitle ?? "Demo purchase need"}
-                    </s-text>
-                    {purchaseOrder.relatedOrderNumber && (
-                      <s-text> · Order {purchaseOrder.relatedOrderNumber}</s-text>
-                    )}
-                    <s-text> · Lines: {purchaseOrder.lineCount}</s-text>
-                  </s-paragraph>
-                  {purchaseOrder.status === "DRAFT" && (
-                    <Form method="post">
-                      <input
-                        type="hidden"
-                        name="intent"
-                        value="send-demo-purchase-order"
-                      />
-                      <input
-                        type="hidden"
-                        name="purchaseOrderId"
-                        value={purchaseOrder.id}
-                      />
-                      <s-button
-                        type="submit"
-                        variant="secondary"
-                        {...(isSubmitting ? { loading: true } : {})}
-                      >
-                        Demo: Send Purchase Order
-                      </s-button>
-                    </Form>
-                  )}
-                  {["SENT", "PARTIALLY_RECEIVED"].includes(
-                    purchaseOrder.status,
-                  ) && (
-                    <Form method="post">
-                      <input
-                        type="hidden"
-                        name="intent"
-                        value="post-demo-goods-receipt"
-                      />
-                      <input
-                        type="hidden"
-                        name="purchaseOrderId"
-                        value={purchaseOrder.id}
-                      />
-                      <s-button
-                        type="submit"
-                        variant="secondary"
-                        {...(isSubmitting ? { loading: true } : {})}
-                      >
-                        Demo: Post Goods Receipt
-                      </s-button>
-                    </Form>
-                  )}
-                </s-stack>
-              </s-box>
-            ))}
-          </s-stack>
-        ) : (
-          <EmptyState>No Purchase Orders yet.</EmptyState>
-        )}
-      </s-section>
-
-      <s-section heading="Goods Receipts">
-        {data.dashboard?.goodsReceipts.length ? (
-          <s-stack direction="block" gap="base">
-            {data.dashboard.goodsReceipts.map((receipt) => (
-              <s-box
-                key={receipt.id}
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-              >
-                <s-paragraph>
-                  <s-text>{receipt.receiptNumber ?? receipt.id}</s-text>
-                  <s-text> · {receipt.status}</s-text>
-                  <s-text> · PO {receipt.poNumber ?? receipt.purchaseOrderId}</s-text>
-                </s-paragraph>
-                <s-paragraph>
-                  <s-text>{receipt.sku ?? receipt.title ?? "Received item"}</s-text>
-                  <s-text>
-                    {" "}
-                    · received {formatQuantity(receipt.quantityReceived)}
-                  </s-text>
-                  {receipt.movementType && (
-                    <s-text> · movement {receipt.movementType}</s-text>
-                  )}
-                </s-paragraph>
-              </s-box>
-            ))}
-          </s-stack>
-        ) : (
-          <EmptyState>No Goods Receipts yet.</EmptyState>
-        )}
-      </s-section>
-
-      <s-section heading="Inventory Movements">
-        {data.dashboard?.inventoryMovements.length ? (
-          <s-stack direction="block" gap="base">
-            {data.dashboard.inventoryMovements.map((movement) => (
-              <s-box
-                key={movement.id}
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-              >
-                <s-paragraph>
-                  <s-text>{movement.sku ?? movement.title ?? movement.id}</s-text>
-                  <s-text> · {movement.movementType}</s-text>
-                  <s-text> · source {movement.sourceType}</s-text>
-                  <s-text>
-                    {" "}
-                    · qty {formatQuantity(movement.quantityDelta)}, reserved{" "}
-                    {formatQuantity(movement.reservationDelta)}
-                  </s-text>
-                </s-paragraph>
-              </s-box>
-            ))}
-          </s-stack>
-        ) : (
-          <EmptyState>No Inventory Movements yet.</EmptyState>
-        )}
       </s-section>
     </s-page>
   );
